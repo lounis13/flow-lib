@@ -1,0 +1,58 @@
+{
+  "id": "862eacfa-7b9d-44cb-97b0-08b7ac26c4e6",
+  "flow_name": "simple_pricing_flow",
+  "params": {
+    "version": "v2"
+  },
+  "state": "success",
+  "start_date": "2025-10-24T14:49:36.070763",
+  "end_date": "2025-10-24T16:49:36.075638",
+  "tasks": {
+    "build": {
+      "task_id": "build",
+      "state": "success",
+      "try_number": 0,
+      "input_json": {},
+      "output_json": {
+        "image": "v2"
+      },
+      "error": null,
+      "start_date": "2025-10-24T16:49:36.071958",
+      "end_date": "2025-10-24T16:49:36.072003"
+    },
+    "pricing": {
+      "task_id": "pricing",
+      "state": "success",
+      "try_number": 0,
+      "input_json": {},
+      "output_json": {
+        "price": 123
+      },
+      "error": null,
+      "start_date": "2025-10-24T16:49:36.072458",
+      "end_date": "2025-10-24T16:49:36.072502"
+    },
+    "compare": {
+      "task_id": "compare",
+      "state": "success",
+      "try_number": 1,
+      "input_json": {},
+      "output_json": {
+        "result": "ok"
+      },
+      "error": "Traceback (most recent call last):\n  File \"<input>\", line 160, in _execute_one\n  File \"<input>\", line 203, in compare\nRuntimeError: Fail once!\n",
+      "start_date": "2025-10-24T16:49:36.073942",
+      "end_date": "2025-10-24T16:49:36.073986"
+    },
+    "notify": {
+      "task_id": "notify",
+      "state": "success",
+      "try_number": 0,
+      "input_json": {},
+      "output_json": null,
+      "error": null,
+      "start_date": "2025-10-24T16:49:36.075068",
+      "end_date": "2025-10-24T16:49:36.075103"
+    }
+  }
+}
