@@ -1,6 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks
 
-from app.application.night_batch_flow import night_batch_flow
+from app.application.flow_store import store
+from app.application.night_batch_flow import build_night_batch_flow
 
 job_router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
@@ -12,11 +13,14 @@ async def get_all():
 
 @job_router.post("/", summary="Trigger a job")
 async def trigger(background_tasks: BackgroundTasks):
-    run_id = night_batch_flow.start_run(params={
-        "run_types": ["hpl", "ftb"]
-    })
+    params = {
+        "libraries": [{"version": "1.2.0"}, {"version": "1.3.1"}],
+        "run_types": [{"type": "ftb"}, {"type": "hpl"}]
+    }
+    flow = build_night_batch_flow(params=params)
+    run_id = flow.init_run(params=params)
     background_tasks.add_task(
-        night_batch_flow.run_until_complete,
+        flow.run_until_complete,
         run_id=run_id,
         max_concurrency=4
     )
@@ -25,7 +29,10 @@ async def trigger(background_tasks: BackgroundTasks):
 
 @job_router.get("/{job_id}", summary="Get a job")
 async def get_job(job_id: str):
-    return night_batch_flow.get_execution_details(job_id)
+    job = store.load(job_id)
+    flow = build_night_batch_flow(job.params)
+    return flow.get_execution_details(job_id)
+
 
 
 @job_router.delete("/{job_id}", summary="Delete a job")

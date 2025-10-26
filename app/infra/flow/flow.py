@@ -1,635 +1,735 @@
 # app/infra/flow/flow.py
+"""
+Async workflow orchestration engine.
+
+This module provides a declarative, type-safe workflow engine for building
+and executing directed acyclic graphs (DAGs) of tasks with support for:
+- Task dependencies and parallel execution
+- Nested subflows
+- Automatic and manual retries
+- State persistence
+- Event-driven execution
+"""
 from __future__ import annotations
 
 import asyncio
-import inspect
-import traceback
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from enum import Enum
-from typing import Callable, Dict, Any, List, Optional, Union
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
-from app.infra.flow.models import WorkflowRun, State, TaskInstance, Store, TaskType
-
-
-# ============================================================
-# Context
-# ============================================================
-class Context:
-    def __init__(self, run: WorkflowRun, task: TaskInstance):
-        self.run = run
-        self.task = task
-        self._pushed: Optional[dict] = None
-
-    @property
-    def params(self): return self.run.params
-
-    @property
-    def task_id(self): return self.task.task_id
-
-    @property
-    def try_number(self): return self.task.try_number
-
-    def pull(self, task_id: str):
-        t = self.run.tasks.get(task_id)
-        return t.output_json if t and t.state == State.SUCCESS else None
-
-    def push(self, value: Any): self._pushed = value
-
-    def _get_pushed(self): return self._pushed
-
-    def log(self, msg: str):
-        now = datetime.now().isoformat(timespec="seconds")
-        print(f"[{now}] [{self.run.id}::{self.task.task_id}#{self.task.try_number}] {msg}")
+from app.infra.flow.event_manager import (
+    DependencyResolver,
+    EventManager,
+    WorkflowEventHandler,
+)
+from app.infra.flow.executors import StandardTaskExecutor, SubFlowExecutor
+from app.infra.flow.models import (
+    Context,
+    EventType,
+    ExecutionState,
+    Store,
+    SubFlowDefinition,
+    TaskDefinition,
+    TaskDefinitionSchema,
+    TaskExecutionSchema,
+    TaskInstance,
+    TaskType,
+    WorkflowExitEvent,
+    WorkflowRun,
+    FlowDefinitionSchema,
+    FlowExecutionSchema,
+)
+from app.infra.flow.retry_manager import RetryManager
 
 
-# ============================================================
-# Core flow data types
-# ============================================================
-@dataclass
-class TaskDef:
-    func: Callable[[Context], Any]
-    type: TaskType = TaskType.TASK
-    depends_on: List[str] = field(default_factory=list)
-    retries: int = 0
-    retry_delay: Optional[timedelta] = None
-
-
-@dataclass
-class SubFlowDef:
-    flow: AsyncFlow
-    depends_on: List[str] = field(default_factory=list)
-    retries: int = 0
-    retry_delay: Optional[timedelta] = None
-
-
-class EventType(Enum):
-    TASK_DONE = "TASK_DONE"
-    TASK_FAILED = "TASK_FAILED"
-    EXIT = "EXIT"
-
-
-@dataclass(frozen=True)
-class TaskEvent:
-    type: EventType
-    task_id: str
-    run_id: str
-
-
-@dataclass(frozen=True)
-class ExitEvent:
-    type: EventType
-    run_id: str
-
-
-Event = Union[TaskEvent, ExitEvent]
-
-
-# ============================================================
-# AsyncFlow
-# ============================================================
 class AsyncFlow:
-    def __init__(self, name: str, store: Optional[Store] = None):
-        self.name = name
+    """
+    Declarative async workflow orchestration engine.
+
+    Provides a fluent API for defining and executing workflows with:
+    - Task registration via decorators
+    - Dependency management
+    - Retry policies
+    - Subflow composition
+    - Concurrent execution with configurable limits
+
+    Example:
+        ```python
+        flow = AsyncFlow("my_workflow", store)
+
+        @flow.task("task_1")
+        def task_1(ctx: Context):
+            return {"result": "data"}
+
+        @flow.task("task_2", depends_on=["task_1"])
+        def task_2(ctx: Context):
+            data = ctx.pull_output("task_1")
+            return {"processed": data}
+
+        run_id = flow.start_run(params={"input": "value"})
+        await flow.run_until_complete(run_id)
+        ```
+    """
+
+    def __init__(self, flow_name: str, store: Optional[Store] = None):
+        """
+        Initialize a new workflow.
+
+        Args:
+            flow_name: Unique name for this workflow
+            store: Storage backend for persisting execution state
+        """
+        self.flow_name = flow_name
         self._store = store
-        self._tasks: Dict[str, TaskDef] = {}
-        self._subflows: Dict[str, SubFlowDef] = {}
 
-        # IPC & concurrency per run
-        self._event_queues: Dict[str, asyncio.Queue[Event]] = {}  # run_id -> queue
-        self._locks: Dict[str, asyncio.Lock] = {}                 # run_id -> lock
-        self._sem: Optional[asyncio.Semaphore] = None             # global concurrency limit
+        # Task and subflow registries
+        self._task_definitions: Dict[str, TaskDefinition] = {}
+        self._subflow_definitions: Dict[str, SubFlowDefinition] = {}
 
-    # ---------------- IPC helpers ----------------
-    def _get_event_queue(self, run_id: str) -> asyncio.Queue[Event]:
-        q = self._event_queues.get(run_id)
-        if q is None:
-            # Option: asyncio.Queue(maxsize=1000) for backpressure
-            q = asyncio.Queue()
-            self._event_queues[run_id] = q
-        return q
+        # Execution management
+        self._event_manager = EventManager()
+        self._run_locks: Dict[str, asyncio.Lock] = {}
+        self._concurrency_semaphore: Optional[asyncio.Semaphore] = None
 
-    def _get_run_lock(self, run_id: str) -> asyncio.Lock:
-        lock = self._locks.get(run_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[run_id] = lock
-        return lock
+        # Dependency and retry managers (lazy init)
+        self._dependency_resolver: Optional[DependencyResolver] = None
+        self._retry_manager: Optional[RetryManager] = None
 
-    @asynccontextmanager
-    async def _run_lock(self, run_id: str):
-        lock = self._get_run_lock(run_id)
-        async with lock:
-            yield
+    # ================================================================
+    #                   TASK REGISTRATION (Public API)
+    # ================================================================
 
-    def _cleanup_run_ipc(self, run_id: str):
-        self._event_queues.pop(run_id, None)
-        self._locks.pop(run_id, None)
+    def add_task_definition(
+            self,
+            task_id: str,
+            task_function: Callable[[Context], Any],
+            *,
+            task_type: TaskType = TaskType.TASK,
+            dependencies: Optional[List[str]] = None,
+            max_retries: int = 0,
+            retry_delay=None,
+    ) -> AsyncFlow:
+        """
+        Register a task definition.
 
-    async def _emit(self, event: Event):
-        await self._get_event_queue(event.run_id).put(event)
+        Unified public method for task registration, used by both
+        decorators and workflow builders.
 
-    async def _call_task_fn(self, fn: Callable[[Context], Any], ctx: Context):
-        res = fn(ctx)
-        if inspect.isawaitable(res):
-            return await res
-        return res
+        Args:
+            task_id: Unique identifier for the task
+            task_function: The callable that executes the task logic
+            task_type: Type of task (default: TASK)
+            dependencies: List of task IDs that must complete before this task
+            max_retries: Maximum number of retry attempts on failure
+            retry_delay: Time to wait between retries (timedelta)
 
-    # ---------------- Task registration ----------------
-    def task(self, task_id: str, *, type: TaskType = TaskType.TASK, depends_on=None, retries=0, retry_delay=None):
-        depends_on = depends_on or []
+        Returns:
+            Self for method chaining
+        """
+        self._task_definitions[task_id] = TaskDefinition(
+            task_function=task_function,
+            task_type=task_type,
+            dependencies=dependencies or [],
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+        return self
 
-        def decorator(fn: Callable[[Context], Any]):
-            self._tasks[task_id] = TaskDef(fn, type, depends_on, retries, retry_delay)
-            return fn
+    def add_subflow_definition(
+            self,
+            subflow_id: str,
+            child_flow: AsyncFlow,
+            *,
+            dependencies: Optional[List[str]] = None,
+            max_retries: int = 0,
+            retry_delay=None,
+            params: dict = None,
+    ) -> AsyncFlow:
+        """
+        Register a subflow definition.
+
+        Unified public method for subflow registration, used by both
+        decorators and workflow builders.
+
+        Args:
+            subflow_id: Unique identifier for the subflow
+            child_flow: The AsyncFlow instance to execute as a subflow
+            dependencies: List of task IDs that must complete before this subflow
+            max_retries: Maximum number of retry attempts on failure
+            retry_delay: Time to wait between retries (timedelta)
+            params: Input parameters for the subflow
+
+        Returns:
+            Self for method chaining
+        """
+        self._subflow_definitions[subflow_id] = SubFlowDefinition(
+            child_flow=child_flow,
+            dependencies=dependencies or [],
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            params=params
+        )
+        return self
+
+    def task(
+            self,
+            task_id: str,
+            *,
+            task_type: TaskType = TaskType.TASK,
+            depends_on: Optional[List[str]] = None,
+            max_retries: int = 0,
+            retry_delay=None,
+    ) -> Callable:
+        """
+        Decorator to register a task in the workflow.
+
+        Args:
+            task_id: Unique identifier for the task
+            task_type: Type of task (default: TASK)
+            depends_on: List of task IDs that must complete before this task
+            max_retries: Maximum number of retry attempts on failure
+            retry_delay: Time to wait between retries (timedelta)
+
+        Returns:
+            Decorator function
+
+        Example:
+            ```python
+            @flow.task("extract_data", depends_on=["validate"])
+            def extract(ctx: Context):
+                ctx.log("Extracting data...")
+                return {"data": [1, 2, 3]}
+            ```
+        """
+
+        def decorator(task_function: Callable[[Context], Any]):
+            self.add_task_definition(
+                task_id=task_id,
+                task_function=task_function,
+                task_type=task_type,
+                dependencies=depends_on,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+            return task_function
 
         return decorator
 
-    def subflow(self, subflow_id: str, *, depends_on=None, retries=0, retry_delay=None):
-        """Decorator to register a subflow"""
-        depends_on = depends_on or []
+    def subflow(
+            self,
+            subflow_id: str,
+            *,
+            depends_on: Optional[List[str]] = None,
+            max_retries: int = 0,
+            retry_delay=None,
+            params: dict = None,
+    ) -> Callable:
+        """
+        Decorator to register a subflow (nested workflow).
 
-        def decorator(flow: AsyncFlow):
-            self._subflows[subflow_id] = SubFlowDef(flow, depends_on, retries, retry_delay)
-            return flow
+        Args:
+            subflow_id: Unique identifier for the subflow
+            depends_on: List of task IDs that must complete before this subflow
+            max_retries: Maximum number of retry attempts on failure
+            retry_delay: Time to wait between retries (timedelta)
+
+        Returns:
+            Decorator function
+
+        Example:
+            ```python
+            @flow.subflow("process_batch", depends_on=["extract"])
+            def get_batch_flow(ctx: Context):
+                return batch_processing_flow
+            ```
+            :param params:
+        """
+
+        def decorator(child_flow_fn: Callable):
+            # Call the function to get the actual AsyncFlow instance
+            actual_flow = child_flow_fn(None) if callable(child_flow_fn) else child_flow_fn
+            self.add_subflow_definition(
+                subflow_id=subflow_id,
+                child_flow=actual_flow,
+                dependencies=depends_on,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                params=params,
+            )
+            return child_flow_fn
 
         return decorator
 
-    def add_subflow(self, subflow_id: str, flow: AsyncFlow, *, depends_on=None, retries=0, retry_delay=None):
-        """Registers a subflow manually"""
-        depends_on = depends_on or []
-        self._subflows[subflow_id] = SubFlowDef(flow, depends_on, retries, retry_delay)
-        return flow
+    def has_task(self, task_id: str) -> bool:
+        """
+        Check if a task exists in the workflow.
 
-    # ---------------- Run lifecycle ----------------
-    def start_run(self, params=None, parent_run_id: str | None = None, parent_task_id: str | None = None,
-                  run_id: str | None = None) -> str:
-        # If a run_id is provided and exists, update it instead of creating a new one
+        Args:
+            task_id: ID of the task to check
+
+        Returns:
+            True if the task exists
+        """
+        return task_id in self._task_definitions
+
+    def update_task_retry_policy(
+            self,
+            task_id: str,
+            max_retries: int,
+            retry_delay=None,
+    ) -> AsyncFlow:
+        """
+        Update the retry policy for an existing task.
+
+        This is a public method intended for workflow builder patterns.
+
+        Args:
+            task_id: ID of the task to update
+            max_retries: Maximum number of retry attempts
+            retry_delay: Time to wait between retries (timedelta)
+
+        Returns:
+            Self for method chaining
+
+        Raises:
+            KeyError: If task_id doesn't exist
+        """
+        if task_id not in self._task_definitions:
+            raise KeyError(f"Task '{task_id}' not found in workflow")
+
+        task_def = self._task_definitions[task_id]
+        task_def.max_retries = max_retries
+        task_def.retry_delay = retry_delay
+        return self
+
+    # ================================================================
+    #                   WORKFLOW LIFECYCLE
+    # ================================================================
+
+    def init_run(
+            self,
+            params: Optional[Dict[str, Any]] = None,
+            parent_run_id: Optional[str] = None,
+            parent_task_id: Optional[str] = None,
+            run_id: Optional[str] = None,
+    ) -> str:
+        """
+        Initialize a new workflow run.
+
+        Creates task instances for all registered tasks and subflows,
+        and recursively initializes child runs for subflows.
+
+        Args:
+            params: Input parameters for the workflow
+            parent_run_id: ID of parent workflow (if this is a subflow)
+            parent_task_id: ID of parent task (if this is a subflow)
+            run_id: Optional run ID to reuse (for retries)
+
+        Returns:
+            The run ID of the created workflow run
+        """
+        # Check if run exists and update it
         if run_id and self._store.exists(run_id):
-            run = self._store.load(run_id)
-            run.params = params or {}
-            run.parent_run_id = parent_run_id
-            run.parent_task_id = parent_task_id
+            workflow_run = self._store.load(run_id)
+            workflow_run.params = params or {}
+            workflow_run.parent_run_id = parent_run_id
+            workflow_run.parent_task_id = parent_task_id
         else:
-            # Create a new run
+            # Create new run
             run_id = run_id or str(uuid.uuid4())
-            run = WorkflowRun(
+            workflow_run = WorkflowRun(
                 id=run_id,
-                flow_name=self.name,
+                flow_name=self.flow_name,
                 params=params or {},
                 parent_run_id=parent_run_id,
                 parent_task_id=parent_task_id,
             )
-            # Create TaskInstances for normal tasks
-            for t in self._tasks:
-                run.tasks[t] = TaskInstance(task_id=t, type=self._tasks.get(t).type)
 
-            # Create TaskInstances for subflows (type FLOW)
-            for sf_id in self._subflows:
-                run.tasks[sf_id] = TaskInstance(task_id=sf_id, type=TaskType.FLOW)
+            # Create task instances for standard tasks
+            for task_id in self._task_definitions:
+                workflow_run.tasks[task_id] = TaskInstance(
+                    task_id=task_id,
+                    type=self._task_definitions[task_id].task_type,
+                )
 
-        self._store.save(run)
+            # Create task instances for subflows
+            for subflow_id in self._subflow_definitions:
+                workflow_run.tasks[subflow_id] = TaskInstance(
+                    task_id=subflow_id,
+                    type=TaskType.FLOW,
+                    input_json=self._subflow_definitions[subflow_id].params or {},
+                )
 
-        # Recursively create runs for subflows and their tasks
-        for sf_id, sf_def in self._subflows.items():
-            child_flow = sf_def.flow
+        self._store.save(workflow_run)
+
+        # Recursively initialize subflow runs
+        for subflow_id, subflow_def in self._subflow_definitions.items():
+            child_flow = subflow_def.child_flow
             child_flow._store = self._store
 
-            # Check if a child_run_id already exists
+            # Check if child run already exists
             existing_child_run_id = None
-            if sf_id in run.tasks and run.tasks[sf_id].output_json:
-                existing_child_run_id = run.tasks[sf_id].output_json.get("child_run_id")
+            if subflow_id in workflow_run.tasks and workflow_run.tasks[subflow_id].output_json:
+                existing_child_run_id = workflow_run.tasks[subflow_id].output_json.get(
+                    "child_run_id"
+                )
 
-            child_run_id = child_flow.start_run(
-                params=params or {},
-                parent_run_id=run.id,
-                parent_task_id=sf_id,
-                run_id=existing_child_run_id  # Reuse existing ID if available
+            # Initialize child run
+            subflow_params = subflow_def.params or {}
+            child_run_id = child_flow.init_run(
+                params={**params, **subflow_params} if params else subflow_params,
+                parent_run_id=workflow_run.id,
+                parent_task_id=subflow_id,
+                run_id=existing_child_run_id,
             )
-            # Store the child_run_id in the subflow's TaskInstance
-            run.tasks[sf_id].output_json = {"child_run_id": child_run_id}
 
-        self._store.save(run)
-        return run.id
+            # Store child_run_id in subflow task instance
+            workflow_run.tasks[subflow_id].output_json = {"child_run_id": child_run_id}
 
-    async def run_until_complete(self, run_id: str, max_concurrency: int = 0):
-        run = self._store.load(run_id)
-        async with self._run_lock(run_id):
-            run.state = State.RUNNING
-            self._store.save(run)
+        self._store.save(workflow_run)
+        return run_id
 
-        self._sem = asyncio.Semaphore(max_concurrency) if max_concurrency and max_concurrency > 0 else None
-        q = self._get_event_queue(run_id)
+    async def run_until_complete(
+            self, run_id: str, max_concurrency: int = 0
+    ) -> None:
+        """
+        Execute the workflow until all tasks complete.
 
-        def ready_to_run_task(task_id: str) -> bool:
-            td = self._tasks[task_id]
-            ti = run.tasks[task_id]
-            return ti.state == State.SCHEDULED and all(run.tasks[d].state == State.SUCCESS for d in td.depends_on)
+        Processes events and launches tasks as their dependencies are satisfied.
+        Blocks until the workflow reaches a terminal state.
 
-        def ready_to_run_subflow(subflow_id: str) -> bool:
-            sf = self._subflows[subflow_id]
-            ti = run.tasks[subflow_id]
-            return ti.state == State.SCHEDULED and all(run.tasks[d].state == State.SUCCESS for d in sf.depends_on)
+        Args:
+            run_id: ID of the workflow run to execute
+            max_concurrency: Maximum number of concurrent tasks (0 = unlimited)
+        """
+        workflow_run = self._store.load(run_id)
 
-        # Launch ready tasks
-        for tid in self._tasks:
-            if ready_to_run_task(tid):
-                asyncio.create_task(self._execute_one(run, tid))
+        # Mark workflow as running
+        async with self._get_run_lock(run_id):
+            workflow_run.state = ExecutionState.RUNNING
+            self._store.save(workflow_run)
 
-        # Launch ready subflows
-        for sf_id in self._subflows:
-            if ready_to_run_subflow(sf_id):
-                asyncio.create_task(self._execute_subflow(run, sf_id))
+        # Initialize managers
+        self._initialize_managers()
 
+        # Set up concurrency limiting
+        if max_concurrency > 0:
+            self._concurrency_semaphore = asyncio.Semaphore(max_concurrency)
+
+        # Get event queue
+        event_queue = self._event_manager.get_event_queue(run_id)
+
+        # Launch initially ready tasks
+        for task_id in self._dependency_resolver.get_ready_tasks(workflow_run):
+            asyncio.create_task(self._execute_task(workflow_run, task_id))
+
+        for subflow_id in self._dependency_resolver.get_ready_subflows(workflow_run):
+            asyncio.create_task(self._execute_subflow(workflow_run, subflow_id))
+
+        # Event processing loop
         try:
             while True:
-                evt = await q.get()
+                event = await event_queue.get()
 
-                if evt.type is EventType.TASK_DONE:
-                    await self._on_task_done(run, evt.task_id)
-                elif evt.type is EventType.TASK_FAILED:
-                    await self._on_task_failed(run, evt.task_id)
-                elif evt.type is EventType.EXIT:
+                if event.event_type == EventType.TASK_COMPLETED:
+                    await self._handle_task_completion(workflow_run, event.task_id)
+                elif event.event_type == EventType.TASK_FAILED:
+                    await self._handle_task_failure(workflow_run, event.task_id)
+                elif event.event_type == EventType.WORKFLOW_EXIT:
                     break
 
-                # Check run completion
-                async with self._run_lock(run_id):
-                    done = all(t.state in (State.SUCCESS, State.FAILED, State.SKIPPED) for t in run.tasks.values())
-                    if done:
-                        run.state = State.SUCCESS if all(t.state == State.SUCCESS for t in run.tasks.values()) else State.FAILED
-                        run.end_date = datetime.now()
-                        self._store.save(run)
-                if done:
-                    await self._emit(ExitEvent(type=EventType.EXIT, run_id=run_id))
+                # Check if workflow is complete
+                # Reload to get fresh state of all tasks
+                workflow_run_check = self._store.load(run_id)
+                event_handler = self._create_event_handler()
+                if event_handler.is_workflow_complete(workflow_run_check):
+                    async with self._get_run_lock(run_id):
+                        # Use the checked instance for final state
+                        workflow_run = workflow_run_check
+                        workflow_run.state = event_handler.compute_workflow_final_state(
+                            workflow_run
+                        )
+                        workflow_run.end_date = datetime.now()
+                        self._store.save(workflow_run)
+                    await self._event_manager.emit_event(
+                        WorkflowExitEvent(
+                            event_type=EventType.WORKFLOW_EXIT, run_id=run_id
+                        )
+                    )
         finally:
-            # Cleanup to avoid leaks (queues/locks per run)
-            self._cleanup_run_ipc(run_id)
+            # Clean up resources
+            self._event_manager.cleanup_run_resources(run_id)
+            self._run_locks.pop(run_id, None)
 
-    # ---------------- Task execution ----------------
-    async def _execute_one(self, run: WorkflowRun, task_id: str):
-        run_id = run.id
-        td = self._tasks[task_id]
+    # ================================================================
+    #                   TASK EXECUTION
+    # ================================================================
 
-        async with self._run_lock(run_id):
-            ti = run.tasks[task_id]
-            if ti.state != State.SCHEDULED:
-                return
-            ti.state = State.RUNNING
-            ti.start_date = datetime.now()
-            self._store.save(run)
+    async def _execute_task(self, workflow_run: WorkflowRun, task_id: str) -> None:
+        """
+        Execute a standard task.
 
-        ctx = Context(run, ti)
-        try:
-            if self._sem:
-                async with self._sem:
-                    res = await self._call_task_fn(td.func, ctx)
-            else:
-                res = await self._call_task_fn(td.func, ctx)
+        Args:
+            workflow_run: The workflow run containing the task
+            task_id: ID of the task to execute
+        """
+        task_def = self._task_definitions[task_id]
+        executor = StandardTaskExecutor(
+            task_definition=task_def,
+            store=self._store,
+            concurrency_semaphore=self._concurrency_semaphore,
+        )
+        await executor.execute(
+            workflow_run=workflow_run,
+            task_id=task_id,
+            run_lock=self._get_run_lock(workflow_run.id),
+            event_emitter=self._event_manager.emit_event,
+        )
 
-            output = ctx._get_pushed() or res
-            async with self._run_lock(run_id):
-                ti = run.tasks[task_id]
-                ti.output_json = output
-                ti.state = State.SUCCESS
-                ti.end_date = datetime.now()
-                self._store.save(run)
+    async def _execute_subflow(
+            self, workflow_run: WorkflowRun, subflow_id: str
+    ) -> None:
+        """
+        Execute a subflow.
 
-            await self._emit(TaskEvent(type=EventType.TASK_DONE, task_id=task_id, run_id=run_id))
+        Args:
+            workflow_run: The workflow run containing the subflow
+            subflow_id: ID of the subflow to execute
+        """
+        subflow_def = self._subflow_definitions[subflow_id]
+        executor = SubFlowExecutor(
+            subflow_definition=subflow_def,
+            store=self._store,
+            concurrency_semaphore=self._concurrency_semaphore,
+        )
+        await executor.execute(
+            workflow_run=workflow_run,
+            task_id=subflow_id,
+            run_lock=self._get_run_lock(workflow_run.id),
+            event_emitter=self._event_manager.emit_event,
+        )
 
-        except Exception:
-            delay = None
-            async with self._run_lock(run_id):
-                ti = run.tasks[task_id]
-                ti.try_number += 1
-                ti.error = traceback.format_exc()
-                ti.end_date = datetime.now()
+    # ================================================================
+    #                   EVENT HANDLING
+    # ================================================================
 
-                if ti.try_number <= td.retries:
-                    ti.state = State.SCHEDULED
-                    self._store.save(run)
-                    delay = td.retry_delay.total_seconds() if td.retry_delay else 0
-                else:
-                    ti.state = State.FAILED
-                    self._store.save(run)
+    async def _handle_task_completion(
+            self, workflow_run: WorkflowRun, task_id: str
+    ) -> None:
+        """
+        Handle task completion event.
 
-            if delay is not None:
-                if delay:
-                    await asyncio.sleep(delay)  # outside lock
-                asyncio.create_task(self._execute_one(run, task_id))
-            else:
-                await self._emit(TaskEvent(type=EventType.TASK_FAILED, task_id=task_id, run_id=run_id))
+        Args:
+            workflow_run: The workflow run (shared instance)
+            task_id: ID of the completed task
+        """
+        event_handler = self._create_event_handler()
+        await event_handler.handle_task_completion(workflow_run, task_id)
 
-    # ---------------- Subflow execution ----------------
-    async def _execute_subflow(self, run: WorkflowRun, subflow_id: str):
-        run_id = run.id
-        sf = self._subflows[subflow_id]
+    async def _handle_task_failure(
+            self, workflow_run: WorkflowRun, task_id: str
+    ) -> None:
+        """
+        Handle task failure event.
 
-        async with self._run_lock(run_id):
-            ti = run.tasks[subflow_id]
-            if ti.state != State.SCHEDULED:
-                return
-            ti.state = State.RUNNING
-            ti.start_date = datetime.now()
+        Args:
+            workflow_run: The workflow run (shared instance)
+            task_id: ID of the failed task
+        """
+        event_handler = self._create_event_handler()
+        await event_handler.handle_task_failure(
+            workflow_run, task_id, self._get_run_lock(workflow_run.id)
+        )
 
-            # Prepare input_json by merging dependency outputs (first attempt only)
-            if ti.try_number == 0:
-                merged_input = {**run.params}
-                for dep_id in sf.depends_on:
-                    dep_task = run.tasks.get(dep_id)
-                    if dep_task and dep_task.state == State.SUCCESS and dep_task.output_json:
-                        merged_input.update(dep_task.output_json)
-                ti.input_json = merged_input
+    # ================================================================
+    #                   RETRY MANAGEMENT
+    # ================================================================
 
-            self._store.save(run)
+    def manual_retry(
+            self, run_id: str, task_id: str, reset_downstream: bool = False
+    ) -> None:
+        """
+        Manually retry a failed task.
 
-        try:
-            # Get the child_run_id
-            child_run_id = ti.output_json.get("child_run_id") if ti.output_json else None
-            if not child_run_id:
-                raise RuntimeError(f"No child_run_id found for subflow {subflow_id}")
+        Args:
+            run_id: ID of the workflow run
+            task_id: ID of the task to retry
+            reset_downstream: Whether to also reset downstream tasks
+        """
+        self._initialize_managers()
+        self._retry_manager.manual_retry(run_id, task_id, reset_downstream)
 
-            # Configure the store for the subflow
-            child_flow = sf.flow
-            child_flow._store = self._store
+    async def retry(
+            self,
+            run_id: str,
+            task_id: str,
+            reset_downstream: bool = True,
+            max_concurrency: int = 0,
+    ) -> None:
+        """
+        Retry a failed task and resume workflow execution.
 
-            # Update the child's params with the subflow input
-            child_run = self._store.load(child_run_id)
-            child_run.params = ti.input_json or {}
-            self._store.save(child_run)
-
-            # Execute the subflow until completion (option: same semaphore)
-            if self._sem:
-                async with self._sem:
-                    await child_flow.run_until_complete(child_run_id)
-            else:
-                await child_flow.run_until_complete(child_run_id)
-
-            # Check the result
-            child_run = self._store.load(child_run_id)
-            if child_run.state == State.SUCCESS:
-                async with self._run_lock(run_id):
-                    ti = run.tasks[subflow_id]
-                    ti.state = State.SUCCESS
-                    ti.end_date = datetime.now()
-                    self._store.save(run)
-                await self._emit(TaskEvent(type=EventType.TASK_DONE, task_id=subflow_id, run_id=run_id))
-                print(f"Event Sent {TaskEvent(type=EventType.TASK_DONE, task_id=subflow_id, run_id=run_id)}")
-            else:
-                raise RuntimeError(f"Subflow {subflow_id} failed")
-
-        except Exception:
-            delay = None
-            async with self._run_lock(run_id):
-                ti = run.tasks[subflow_id]
-                ti.try_number += 1
-                ti.error = traceback.format_exc()
-                ti.end_date = datetime.now()
-
-                if ti.try_number <= sf.retries:
-                    ti.state = State.SCHEDULED
-                    self._store.save(run)
-                    delay = sf.retry_delay.total_seconds() if sf.retry_delay else 0
-                else:
-                    ti.state = State.FAILED
-                    self._store.save(run)
-
-            if delay is not None:
-                if delay:
-                    await asyncio.sleep(delay)
-                asyncio.create_task(self._execute_subflow(run, subflow_id))
-            else:
-                await self._emit(TaskEvent(type=EventType.TASK_FAILED, task_id=subflow_id, run_id=run_id))
-
-    # ---------------- Event reactions ----------------
-    async def _on_task_done(self, run: WorkflowRun, task_id: str):
-        # Schedule ready dependent tasks
-        ready_tasks = [
-            t for t, td in self._tasks.items()
-            if task_id in td.depends_on
-               and all(run.tasks[d].state == State.SUCCESS for d in td.depends_on)
-               and run.tasks[t].state == State.SCHEDULED
-        ]
-        for r in ready_tasks:
-            asyncio.create_task(self._execute_one(run, r))
-
-        # Schedule ready dependent subflows
-        ready_subflows = [
-            sf_id for sf_id, sf in self._subflows.items()
-            if task_id in sf.depends_on
-               and all(run.tasks[d].state == State.SUCCESS for d in sf.depends_on)
-               and run.tasks[sf_id].state == State.SCHEDULED
-        ]
-        for sf_id in ready_subflows:
-            asyncio.create_task(self._execute_subflow(run, sf_id))
-
-    async def _on_task_failed(self, run: WorkflowRun, task_id: str):
-        # Find child tasks/subflows
-        task_children = [t for t, td in self._tasks.items() if task_id in td.depends_on]
-        subflow_children = [sf_id for sf_id, sf in self._subflows.items() if task_id in sf.depends_on]
-        now = datetime.now()
-
-        async with self._run_lock(run.id):
-            # Skip child tasks
-            for cid in task_children:
-                cti = run.tasks[cid]
-                if cti.state == State.SCHEDULED:
-                    cti.state = State.SKIPPED
-                    cti.end_date = now
-            # Skip child subflows
-            for sf_id in subflow_children:
-                sf_ti = run.tasks[sf_id]
-                if sf_ti.state == State.SCHEDULED:
-                    sf_ti.state = State.SKIPPED
-                    sf_ti.end_date = now
-            self._store.save(run)
-
-    # ---------------- Retry ----------------
-    def manual_retry(self, run_id: str, task_id: str, *, reset_downstream: bool = False) -> None:
-        run = self._store.load(run_id)
-        if task_id not in run.tasks:
-            raise KeyError(f"unknown task_id: {task_id}")
-
-        ti = run.tasks[task_id]
-        ti.state = State.SCHEDULED
-        ti.end_date = None
-        ti.error = None
-        ti.try_number = 0
-
-        # If it's a subflow (type FLOW), reset the subflow's tasks
-        if ti.type == TaskType.FLOW:
-            child_run_id = ti.output_json.get("child_run_id") if ti.output_json else None
-            if child_run_id:
-                try:
-                    child_run = self._store.load(child_run_id)
-                    # Restore params from input_json for retry
-                    if ti.input_json:
-                        child_run.params = ti.input_json
-                    # Reset all subflow tasks
-                    for child_ti in child_run.tasks.values():
-                        if child_ti.state in (State.SUCCESS, State.FAILED, State.SKIPPED):
-                            child_ti.state = State.SCHEDULED
-                            child_ti.end_date = None
-                            child_ti.try_number = 0
-                            child_ti.error = None
-                    child_run.state = State.SCHEDULED
-                    child_run.end_date = None
-                    self._store.save(child_run)
-                except Exception:
-                    # The child run may not exist yet or other store issue
-                    pass
-
-        if run.state in (State.SUCCESS, State.FAILED):
-            run.state = State.RUNNING
-            run.end_date = None
-
-        if reset_downstream:
-            for child in self._downstream_of(task_id):
-                if child in run.tasks:
-                    cti = run.tasks[child]
-                    if cti.state in (State.SUCCESS, State.FAILED, State.SKIPPED):
-                        cti.state = State.SCHEDULED
-                        cti.end_date = None
-                        cti.error = None
-                        cti.try_number = 0
-
-                        # If the child is also a subflow, reset its tasks too
-                        if cti.type == TaskType.FLOW:
-                            child_run_id = cti.output_json.get("child_run_id") if cti.output_json else None
-                            if child_run_id:
-                                try:
-                                    child_run = self._store.load(child_run_id)
-                                    # Restore params from input_json for retry
-                                    if cti.input_json:
-                                        child_run.params = cti.input_json
-                                    for child_ti in child_run.tasks.values():
-                                        if child_ti.state in (State.SUCCESS, State.FAILED, State.SKIPPED):
-                                            child_ti.state = State.SCHEDULED
-                                            child_ti.end_date = None
-                                            child_ti.try_number = 0
-                                            child_ti.error = None
-                                    child_run.state = State.SCHEDULED
-                                    child_run.end_date = None
-                                    self._store.save(child_run)
-                                except Exception:
-                                    pass
-
-        self._store.save(run)
-
-    async def retry(self, run_id: str, task_id: str, *, reset_downstream: bool = True, max_concurrency: int = 0):
+        Args:
+            run_id: ID of the workflow run
+            task_id: ID of the task to retry
+            reset_downstream: Whether to also reset downstream tasks
+            max_concurrency: Maximum number of concurrent tasks
+        """
         self.manual_retry(run_id, task_id, reset_downstream=reset_downstream)
         await self.run_until_complete(run_id, max_concurrency=max_concurrency)
 
-    # ---------------- Helpers ----------------
-    def _downstream_of(self, root: str) -> List[str]:
-        """Returns all descendants (tasks and subflows) of a given node"""
-        rev: Dict[str, List[str]] = {}
-        # Add task dependencies
-        for t, td in self._tasks.items():
-            for d in td.depends_on:
-                rev.setdefault(d, []).append(t)
-        # Add subflow dependencies
-        for sf_id, sf in self._subflows.items():
-            for d in sf.depends_on:
-                rev.setdefault(d, []).append(sf_id)
+    # ================================================================
+    #                   SERIALIZATION
+    # ================================================================
 
-        out, stack, seen = [], [root], {root}
-        while stack:
-            cur = stack.pop()
-            for child in rev.get(cur, []):
-                if child not in seen:
-                    seen.add(child)
-                    out.append(child)
-                    stack.append(child)
-        return out
+    def get_execution_details(self, run_id: str) -> FlowExecutionSchema:
+        """
+        Get complete execution details with strong typing.
 
-    # ---------------- Serialization ----------------
-    def get_execution_details(self, run_id: str):
+        Returns a serializable representation of the workflow execution
+        including all task states and subflow details.
+
+        Args:
+            run_id: ID of the workflow run
+
+        Returns:
+            Structured execution details
         """
-        Returns the complete execution details of a flow with strong typing.
-        Uses dataclasses for clean abstraction.
+        workflow_run = self._store.load(run_id)
+        return self._build_execution_schema(workflow_run, self)
+
+    def _build_execution_schema(
+            self, workflow_run: WorkflowRun, flow_def: AsyncFlow
+    ) -> FlowExecutionSchema:
         """
-        from app.infra.flow.flow_schema import (
-            FlowExecution,
-            TaskExecution,
-            FlowDefinition,
-            TaskDefinition,
+        Recursively build execution schema for a workflow run.
+
+        Args:
+            workflow_run: The workflow run to serialize
+            flow_def: The flow definition
+
+        Returns:
+            Complete execution schema
+        """
+        # Build flow definition schema
+        task_def_schemas = {}
+        for task_id, task_def in flow_def._task_definitions.items():
+            task_def_schemas[task_id] = TaskDefinitionSchema(
+                task_id=task_id,
+                task_type=task_def.task_type,
+                dependencies=task_def.dependencies,
+                max_retries=task_def.max_retries,
+            )
+
+        for subflow_id, subflow_def in flow_def._subflow_definitions.items():
+            task_def_schemas[subflow_id] = TaskDefinitionSchema(
+                task_id=subflow_id,
+                task_type="flow",
+                dependencies=subflow_def.dependencies,
+                max_retries=subflow_def.max_retries,
+                flow_name=subflow_def.child_flow.flow_name,
+            )
+
+        flow_definition = FlowDefinitionSchema(
+            flow_name=flow_def.flow_name,
+            tasks=task_def_schemas,
         )
 
-        run = self._store.load(run_id)
+        # Build task execution schemas
+        task_exec_schemas = {}
+        for task_id, task_instance in workflow_run.tasks.items():
+            # Get dependencies
+            dependencies = []
+            if task_id in flow_def._task_definitions:
+                dependencies = flow_def._task_definitions[task_id].dependencies
+            elif task_id in flow_def._subflow_definitions:
+                dependencies = flow_def._subflow_definitions[task_id].dependencies
 
-        def build_flow_execution(run_obj, flow_def) -> FlowExecution:
-            # Build flow definition
-            flow_tasks_def = {}
-            for task_id, task_def in flow_def._tasks.items():
-                flow_tasks_def[task_id] = TaskDefinition(
-                    task_id=task_id,
-                    type=task_def.type,
-                    depends_on=task_def.depends_on,
-                    retries=task_def.retries,
-                )
-
-            for subflow_id, subflow_def in flow_def._subflows.items():
-                flow_tasks_def[subflow_id] = TaskDefinition(
-                    task_id=subflow_id,
-                    type="flow",
-                    depends_on=subflow_def.depends_on,
-                    retries=subflow_def.retries,
-                    flow_name=subflow_def.flow.name,
-                )
-
-            flow_definition = FlowDefinition(
-                name=flow_def.name,
-                tasks=flow_tasks_def,
+            task_exec_schema = TaskExecutionSchema(
+                task_id=task_instance.task_id,
+                task_type=task_instance.type,
+                state=task_instance.state,
+                attempt_number=task_instance.try_number,
+                dependencies=dependencies,
+                input_data=task_instance.input_json,
+                output_data=task_instance.output_json,
+                error_message=task_instance.error,
+                start_timestamp=task_instance.start_date.isoformat()
+                if task_instance.start_date
+                else None,
+                end_timestamp=task_instance.end_date.isoformat()
+                if task_instance.end_date
+                else None,
             )
 
-            # Build task executions
-            tasks_execution = {}
-            for task_id, task in run_obj.tasks.items():
-                # Get dependencies
-                depends_on = []
-                if task_id in flow_def._tasks:
-                    depends_on = flow_def._tasks[task_id].depends_on
-                elif task_id in flow_def._subflows:
-                    depends_on = flow_def._subflows[task_id].depends_on
+            # Recursively add subflow execution
+            if (
+                    task_instance.type == "flow"
+                    and task_instance.output_json
+                    and "child_run_id" in task_instance.output_json
+            ):
+                child_run_id = task_instance.output_json["child_run_id"]
+                try:
+                    child_run = self._store.load(child_run_id)
+                    child_flow_def = flow_def._subflow_definitions[task_id].child_flow
+                    task_exec_schema.subflow_execution = self._build_execution_schema(
+                        child_run, child_flow_def
+                    )
+                except Exception:
+                    task_exec_schema.subflow_execution = None
 
-                task_exec = TaskExecution(
-                    task_id=task.task_id,
-                    type=task.type,
-                    state=task.state,
-                    try_number=task.try_number,
-                    depends_on=depends_on,
-                    input_json=task.input_json,
-                    output_json=task.output_json,
-                    error=task.error,
-                    start_date=task.start_date.isoformat() if task.start_date else None,
-                    end_date=task.end_date.isoformat() if task.end_date else None,
-                )
+            task_exec_schemas[task_id] = task_exec_schema
 
-                # If it's a subflow, add recursively
-                if task.type == "flow" and task.output_json and "child_run_id" in task.output_json:
-                    child_run_id = task.output_json["child_run_id"]
-                    try:
-                        child_run = self._store.load(child_run_id)
-                        child_flow_def = flow_def._subflows[task_id].flow
-                        task_exec.subflow = build_flow_execution(child_run, child_flow_def)
-                    except Exception:
-                        task_exec.subflow = None
+        return FlowExecutionSchema(
+            run_id=workflow_run.id,
+            flow_name=workflow_run.flow_name,
+            params=workflow_run.params,
+            state=workflow_run.state,
+            start_timestamp=workflow_run.start_date.isoformat()
+            if workflow_run.start_date
+            else None,
+            end_timestamp=workflow_run.end_date.isoformat()
+            if workflow_run.end_date
+            else None,
+            parent_run_id=workflow_run.parent_run_id,
+            parent_task_id=workflow_run.parent_task_id,
+            flow_definition=flow_definition,
+            task_executions=task_exec_schemas,
+        )
 
-                tasks_execution[task_id] = task_exec
+    # ================================================================
+    #                   INTERNAL HELPERS
+    # ================================================================
 
-            return FlowExecution(
-                id=run_obj.id,
-                flow_name=run_obj.flow_name,
-                params=run_obj.params,
-                state=run_obj.state,
-                start_date=run_obj.start_date.isoformat() if run_obj.start_date else None,
-                end_date=run_obj.end_date.isoformat() if run_obj.end_date else None,
-                parent_run_id=run_obj.parent_run_id,
-                parent_task_id=run_obj.parent_task_id,
-                flow=flow_definition,
-                tasks=tasks_execution,
+    def _get_run_lock(self, run_id: str) -> asyncio.Lock:
+        """Get or create a lock for a workflow run."""
+        if run_id not in self._run_locks:
+            self._run_locks[run_id] = asyncio.Lock()
+        return self._run_locks[run_id]
+
+    def _initialize_managers(self) -> None:
+        """Initialize dependency resolver and retry manager if not already done."""
+        if not self._dependency_resolver:
+            self._dependency_resolver = DependencyResolver(
+                self._task_definitions, self._subflow_definitions
             )
 
-        return build_flow_execution(run, self)
+        if not self._retry_manager:
+            self._retry_manager = RetryManager(
+                store=self._store,
+                task_definitions=self._task_definitions,
+                subflow_definitions=self._subflow_definitions,
+                downstream_resolver=self._dependency_resolver,
+            )
+
+    def _create_event_handler(self) -> WorkflowEventHandler:
+        """Create an event handler for workflow coordination."""
+        return WorkflowEventHandler(
+            dependency_resolver=self._dependency_resolver,
+            store=self._store,
+            task_launcher=lambda run, tid: asyncio.create_task(
+                self._execute_task(run, tid)
+                if tid in self._task_definitions
+                else self._execute_subflow(run, tid)
+            ),
+        )
