@@ -608,6 +608,54 @@ class AsyncFlow:
         self.manual_retry(run_id, task_id, reset_downstream=reset_downstream)
         await self.run_until_complete(run_id, max_concurrency=max_concurrency)
 
+    def validate_task_exists(self, run_id: str, task_id: str) -> None:
+        """
+        Validate that a task exists in the workflow run.
+
+        Args:
+            run_id: ID of the workflow run
+            task_id: ID of the task to validate
+
+        Raises:
+            KeyError: If the run_id or task_id does not exist
+        """
+        self._initialize_managers()
+        self._retry_manager.validate_task_exists(run_id, task_id)
+
+    def get_all_failed_tasks(self, run_id: str) -> list[str]:
+        """
+        Get all tasks in failed state.
+
+        Args:
+            run_id: ID of the workflow run
+
+        Returns:
+            List of task IDs that are in failed state
+        """
+        self._initialize_managers()
+        return self._retry_manager.get_all_failed_tasks(run_id)
+
+    async def retry_all_failed(
+            self, run_id: str, max_concurrency: int = 0
+    ) -> list[str]:
+        """
+        Retry all failed tasks and resume workflow execution.
+
+        Args:
+            run_id: ID of the workflow run
+            max_concurrency: Maximum number of concurrent tasks
+
+        Returns:
+            List of task IDs that were retried
+
+        Raises:
+            ValueError: If no failed tasks are found
+        """
+        self._initialize_managers()
+        failed_tasks = self._retry_manager.retry_all_failed(run_id)
+        await self.run_until_complete(run_id, max_concurrency=max_concurrency)
+        return failed_tasks
+
     # ================================================================
     #                   SERIALIZATION
     # ================================================================

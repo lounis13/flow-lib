@@ -239,3 +239,65 @@ class RetryManager:
             )
 
         return None
+
+    def get_all_failed_tasks(self, run_id: str) -> list[str]:
+        """
+        Get all tasks in failed state, including tasks in subflows.
+
+        Args:
+            run_id: ID of the workflow run
+
+        Returns:
+            List of task IDs that are in failed state
+        """
+        workflow_run = self.store.load(run_id)
+        all_tasks = workflow_run.get_all_tasks_recursive(self.store)
+        return [task_id for task_id, task in all_tasks.items() if task.state == ExecutionState.FAILED]
+
+    def retry_all_failed(self, run_id: str) -> list[str]:
+        """
+        Retry all failed tasks in a workflow run.
+
+        This method finds all tasks in failed state and resets them
+        without resetting downstream tasks (to avoid cascading resets).
+
+        Args:
+            run_id: ID of the workflow run
+
+        Returns:
+            List of task IDs that were retried
+
+        Raises:
+            ValueError: If no failed tasks are found
+        """
+        failed_tasks = self.get_all_failed_tasks(run_id)
+
+        if not failed_tasks:
+            raise ValueError(f"No failed tasks found in run '{run_id}'")
+
+        # Retry each failed task without reset_downstream
+        for task_id in failed_tasks:
+            self.manual_retry(run_id=run_id, task_id=task_id, reset_downstream=False)
+
+        return failed_tasks
+
+    def validate_task_exists(self, run_id: str, task_id: str) -> None:
+        """
+        Validate that a task exists in the workflow run.
+
+        Args:
+            run_id: ID of the workflow run
+            task_id: ID of the task to validate
+
+        Raises:
+            KeyError: If the run_id or task_id does not exist
+        """
+        workflow_run = self.store.load(run_id)
+        all_tasks = workflow_run.get_all_tasks_recursive(self.store)
+
+        if task_id not in all_tasks:
+            available_tasks = list(all_tasks.keys())
+            raise KeyError(
+                f"Task '{task_id}' not found in run '{run_id}'. "
+                f"Available tasks: {available_tasks}"
+            )

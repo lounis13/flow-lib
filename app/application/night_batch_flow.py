@@ -33,15 +33,24 @@ def build_run_type_flow(params: dict, type: str):
 
 
 def build_night_batch_flow(params: dict = None):
-    flow = AsyncFlow("night_barch_flow", store)
-    run_type_flows = [f"{run_type.get('type')}_flow" for run_type in params.get("run_types")]
-    for run_type_flow_name in run_type_flows:
-        @flow.subflow(run_type_flow_name)
-        def run_type_flow(ctx: Context):
-            return build_run_type_flow(params, type=run_type_flow_name)
+    flow = AsyncFlow("Night Batch Flow", store)
 
-    @flow.task("send_notification", depends_on=run_type_flows, name="Send Symphony notification")
+    @flow.task("Start Night Batch Flow", name="Start Night Batch Flow")
     def end(ctx: Context):
-        ctx.log(f"send final notification")
+        ctx.log(f"Start Night Batch Flow")
+
+    @flow.subflow(f"Pricing Flow", depends_on=["Start Night Batch Flow"])
+    def build_library_flow(ctx: Context):
+        return build_pricing_flow("Pricing")
+
+    # run_type_flows = [f"{run_type.get('type')}_flow" for run_type in params.get("run_types")]
+    # for run_type_flow_name in run_type_flows:
+    #    @flow.subflow(run_type_flow_name)
+    #    def run_type_flow(ctx: Context):
+    #        return build_run_type_flow(params, type=run_type_flow_name)
+
+    # @flow.task("send_notification", depends_on=run_type_flows, name="Send Symphony notification")
+    # def end(ctx: Context):
+    #    ctx.log(f"send final notification")
 
     return flow
