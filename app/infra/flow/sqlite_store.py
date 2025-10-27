@@ -93,6 +93,8 @@ class SQLiteStore(Store):
             (
                 run_id
                 TEXT,
+                id
+                TEXT,
                 task_id
                 TEXT,
                 type
@@ -192,12 +194,13 @@ class SQLiteStore(Store):
         for t in (run.tasks or {}).values():
             cur.execute(
                 """
-                INSERT INTO task_instance (run_id, task_id, type, state, try_number, input_json, output_json, error,
+                INSERT INTO task_instance (run_id, id, task_id, type, state, try_number, input_json, output_json, error,
                                            start_date, end_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
+                    t.id,
                     t.task_id,
                     str(t.type) if not isinstance(t.type, str) else t.type,
                     str(t.state) if not isinstance(t.state, str) else t.state,
@@ -242,6 +245,7 @@ class SQLiteStore(Store):
         latest_by_task_id: Dict[str, TaskInstance] = {}
         for tr in task_rows:
             ti = TaskInstance(
+                id=tr["id"],
                 task_id=tr["task_id"],
                 type=tr["type"],
                 state=tr["state"],

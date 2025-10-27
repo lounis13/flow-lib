@@ -8,6 +8,7 @@ used throughout the flow library.
 from __future__ import annotations
 
 import enum
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -86,7 +87,7 @@ class TaskInstance:
     error: Optional[str] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
-
+    id: str = str(uuid.uuid4())
 
 # ============================================================
 #                   WORKFLOW RUN
@@ -499,6 +500,7 @@ class TaskExecutionSchema:
         end_timestamp: ISO timestamp of completion
         subflow_execution: Nested subflow execution data (if applicable)
     """
+    id: str
     task_id: str
     task_type: str
     state: str

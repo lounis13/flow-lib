@@ -646,6 +646,7 @@ class AsyncFlow:
                 dependencies = flow_def._subflow_definitions[task_id].dependencies
 
             task_exec_schema = TaskExecutionSchema(
+                id=task_instance.id,
                 task_id=task_instance.task_id,
                 task_type=task_instance.type,
                 state=task_instance.state,
