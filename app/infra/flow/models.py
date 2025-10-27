@@ -171,12 +171,16 @@ class TaskDefinition:
         dependencies: List of task IDs that must complete before this task
         max_retries: Maximum number of retry attempts on failure
         retry_delay: Time to wait between retry attempts
+        name: Human-readable name for the task (optional)
+        description: Description of what the task does (optional)
     """
     task_function: Callable[[Context], Any]
     task_type: TaskType = TaskType.TASK
     dependencies: List[str] = field(default_factory=list)
     max_retries: int = 0
     retry_delay: Optional[timedelta] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 @dataclass
@@ -189,12 +193,17 @@ class SubFlowDefinition:
         dependencies: List of task IDs that must complete before this subflow
         max_retries: Maximum number of retry attempts on failure
         retry_delay: Time to wait between retry attempts
+        params: Parameters to pass to the subflow
+        name: Human-readable name for the subflow (optional)
+        description: Description of what the subflow does (optional)
     """
     child_flow: Any  # AsyncFlow (avoiding circular import)
     dependencies: List[str] = field(default_factory=list)
     max_retries: int = 0
     retry_delay: Optional[timedelta] = None
-    params: dict = {},
+    params: dict = field(default_factory=dict)
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 # ============================================================
@@ -442,12 +451,16 @@ class TaskDefinitionSchema:
         dependencies: List of task IDs this task depends on
         max_retries: Maximum retry attempts
         flow_name: Name of the flow (for subflow tasks only)
+        name: Human-readable name for the task
+        description: Description of what the task does
     """
     task_id: str
     task_type: str
     dependencies: List[str]
     max_retries: int
     flow_name: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 @dataclass
@@ -522,3 +535,135 @@ class FlowExecutionSchema:
     parent_task_id: Optional[str]
     flow_definition: FlowDefinitionSchema
     task_executions: Dict[str, TaskExecutionSchema]
+
+
+# ============================================================
+#                   FLAT EXECUTION SCHEMAS
+# ============================================================
+
+@dataclass
+class FlatTaskSchema:
+    """
+    Flattened task representation for UI consumption.
+
+    All tasks (including those in subflows) are flattened to a single level
+    with their full path as task_id.
+    """
+    id: str
+    task_id: str
+    task_type: str
+    state: str
+    attempt_number: int
+    name: Optional[str] = None  # Human-readable name
+    description: Optional[str] = None  # Description of what the task does
+    input_data: Optional[Dict[str, Any]] = None
+    output_data: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+    start_timestamp: Optional[str] = None
+    end_timestamp: Optional[str] = None
+    duration_ms: Optional[float] = None  # Duration in milliseconds
+
+
+@dataclass
+class TaskDependencySchema:
+    """
+    Represents a dependency between two tasks.
+
+    Attributes:
+        source: Full task_id path of source task (e.g., "ftb_flow.task1")
+        target: Full task_id path of target task (e.g., "ftb_flow.task2")
+        source_id: Real instance ID (UUID) of the source task
+        target_id: Real instance ID (UUID) of the target task
+        source_output: Output data of source task
+        target_input: Input data of target task
+    """
+    source: str  # task_id of source task
+    target: str  # task_id of target task
+    source_id: Optional[str] = None  # Real instance ID of source task
+    target_id: Optional[str] = None  # Real instance ID of target task
+    source_output: Optional[Any] = None  # Output of source task
+    target_input: Optional[Any] = None  # Input of target task
+
+
+@dataclass
+class FlatExecutionSchema:
+    """
+    Flattened execution schema optimized for UI display.
+
+    All tasks are flattened (subflows included) and sorted by start_timestamp.
+    Dependencies are explicitly listed as source->target pairs.
+    """
+    run_id: str
+    flow_name: str
+    params: Dict[str, Any]
+    state: str
+    start_timestamp: Optional[str] = None
+    end_timestamp: Optional[str] = None
+    duration_ms: Optional[float] = None
+    parent_run_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+
+    # Flattened tasks sorted by start_timestamp
+    tasks: List['FlatTaskSchema'] = field(default_factory=list)
+
+    # All dependencies as source -> target pairs
+    dependencies: List['TaskDependencySchema'] = field(default_factory=list)
+
+    # Statistics
+    total_tasks: int = 0
+    successful_tasks: int = 0
+    failed_tasks: int = 0
+    running_tasks: int = 0
+
+
+# ============================================================
+#                   JOB LIST SCHEMAS
+# ============================================================
+
+@dataclass
+class JobSummarySchema:
+    """
+    Summary information for a single job in the list view.
+
+    Provides essential information and statistics without loading full task details.
+    """
+    run_id: str
+    flow_name: str
+    state: str
+    start_timestamp: Optional[str] = None
+    end_timestamp: Optional[str] = None
+    duration_ms: Optional[float] = None
+    parent_run_id: Optional[str] = None
+
+    # Quick stats
+    total_tasks: int = 0
+    successful_tasks: int = 0
+    failed_tasks: int = 0
+    running_tasks: int = 0
+    pending_tasks: int = 0
+
+
+@dataclass
+class JobListStatsSchema:
+    """
+    Aggregated statistics across all jobs.
+    """
+    total_jobs: int = 0
+    running_jobs: int = 0
+    successful_jobs: int = 0
+    failed_jobs: int = 0
+    pending_jobs: int = 0
+
+    total_tasks_across_all_jobs: int = 0
+    total_duration_ms: Optional[float] = None
+    average_duration_ms: Optional[float] = None
+
+
+@dataclass
+class JobListResponseSchema:
+    """
+    Response schema for listing all jobs with aggregated statistics.
+    """
+    jobs: List[JobSummarySchema] = field(default_factory=list)
+    stats: Optional[JobListStatsSchema] = None
+    total_count: int = 0

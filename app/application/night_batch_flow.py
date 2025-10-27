@@ -11,7 +11,7 @@ def build_run_type_flow(params: dict, type: str):
     for library in libraries:
         version = library.get("version")
 
-        @flow.subflow(f"{type}_{version}_flow", params=library)
+        @flow.subflow(f"{type}_{version}_flow", name="Build Fire Bird Image", params=library)
         def build_library_flow(ctx: Context):
             return build_firebird_image_flow(f"{type}_{version}")
 
@@ -40,7 +40,7 @@ def build_night_batch_flow(params: dict = None):
         def run_type_flow(ctx: Context):
             return build_run_type_flow(params, type=run_type_flow_name)
 
-    @flow.task("send_notification", depends_on=run_type_flows)
+    @flow.task("send_notification", depends_on=run_type_flows, name="Send Symphony notification")
     def end(ctx: Context):
         ctx.log(f"send final notification")
 

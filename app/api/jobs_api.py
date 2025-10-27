@@ -2,13 +2,22 @@ from fastapi import APIRouter, BackgroundTasks
 
 from app.application.flow_store import store
 from app.application.night_batch_flow import build_night_batch_flow
+from app.infra.flow import AsyncFlow
 
 job_router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
 
 @job_router.get("/", summary="Get all jobs")
 async def get_all():
-    pass
+    """
+    Get all jobs with summary information and aggregated statistics.
+
+    Returns:
+        - List of all jobs with basic info and task statistics
+        - Aggregated stats across all jobs (total, running, failed, success)
+        - Total task count and average duration
+    """
+    return AsyncFlow.list_all_jobs(store)
 
 
 @job_router.post("/", summary="Trigger a job")
@@ -27,12 +36,19 @@ async def trigger(background_tasks: BackgroundTasks):
     return run_id
 
 
-@job_router.get("/{job_id}", summary="Get a job")
+@job_router.get("/{job_id}", summary="Get a job (flat format)")
+async def get_job_flat(job_id: str):
+    job = store.load(job_id)
+    flow = build_night_batch_flow(job.params)
+    return flow.get_flat_execution_details(job_id)
+
+
+@job_router.get("/{job_id}/flow", summary="Get a job")
 async def get_job(job_id: str):
+    """Get job details in hierarchical format (original endpoint)."""
     job = store.load(job_id)
     flow = build_night_batch_flow(job.params)
     return flow.get_execution_details(job_id)
-
 
 
 @job_router.delete("/{job_id}", summary="Delete a job")

@@ -38,6 +38,12 @@ from app.infra.flow.models import (
     WorkflowRun,
     FlowDefinitionSchema,
     FlowExecutionSchema,
+    FlatExecutionSchema,
+    FlatTaskSchema,
+    TaskDependencySchema,
+    JobSummarySchema,
+    JobListStatsSchema,
+    JobListResponseSchema,
 )
 from app.infra.flow.retry_manager import RetryManager
 
@@ -108,6 +114,8 @@ class AsyncFlow:
             dependencies: Optional[List[str]] = None,
             max_retries: int = 0,
             retry_delay=None,
+            name: Optional[str] = None,
+            description: Optional[str] = None,
     ) -> AsyncFlow:
         """
         Register a task definition.
@@ -122,6 +130,8 @@ class AsyncFlow:
             dependencies: List of task IDs that must complete before this task
             max_retries: Maximum number of retry attempts on failure
             retry_delay: Time to wait between retries (timedelta)
+            name: Human-readable name for the task
+            description: Description of what the task does
 
         Returns:
             Self for method chaining
@@ -132,6 +142,8 @@ class AsyncFlow:
             dependencies=dependencies or [],
             max_retries=max_retries,
             retry_delay=retry_delay,
+            name=name,
+            description=description,
         )
         return self
 
@@ -144,6 +156,8 @@ class AsyncFlow:
             max_retries: int = 0,
             retry_delay=None,
             params: dict = None,
+            name: Optional[str] = None,
+            description: Optional[str] = None,
     ) -> AsyncFlow:
         """
         Register a subflow definition.
@@ -158,6 +172,8 @@ class AsyncFlow:
             max_retries: Maximum number of retry attempts on failure
             retry_delay: Time to wait between retries (timedelta)
             params: Input parameters for the subflow
+            name: Human-readable name for the subflow
+            description: Description of what the subflow does
 
         Returns:
             Self for method chaining
@@ -167,7 +183,9 @@ class AsyncFlow:
             dependencies=dependencies or [],
             max_retries=max_retries,
             retry_delay=retry_delay,
-            params=params
+            params=params,
+            name=name,
+            description=description,
         )
         return self
 
@@ -179,6 +197,8 @@ class AsyncFlow:
             depends_on: Optional[List[str]] = None,
             max_retries: int = 0,
             retry_delay=None,
+            name: Optional[str] = None,
+            description: Optional[str] = None,
     ) -> Callable:
         """
         Decorator to register a task in the workflow.
@@ -189,13 +209,15 @@ class AsyncFlow:
             depends_on: List of task IDs that must complete before this task
             max_retries: Maximum number of retry attempts on failure
             retry_delay: Time to wait between retries (timedelta)
+            name: Human-readable name for the task
+            description: Description of what the task does
 
         Returns:
             Decorator function
 
         Example:
             ```python
-            @flow.task("extract_data", depends_on=["validate"])
+            @flow.task("extract_data", depends_on=["validate"], name="Extract Data", description="Extracts data from source")
             def extract(ctx: Context):
                 ctx.log("Extracting data...")
                 return {"data": [1, 2, 3]}
@@ -210,6 +232,8 @@ class AsyncFlow:
                 dependencies=depends_on,
                 max_retries=max_retries,
                 retry_delay=retry_delay,
+                name=name,
+                description=description,
             )
             return task_function
 
@@ -223,6 +247,8 @@ class AsyncFlow:
             max_retries: int = 0,
             retry_delay=None,
             params: dict = None,
+            name: Optional[str] = None,
+            description: Optional[str] = None,
     ) -> Callable:
         """
         Decorator to register a subflow (nested workflow).
@@ -232,17 +258,19 @@ class AsyncFlow:
             depends_on: List of task IDs that must complete before this subflow
             max_retries: Maximum number of retry attempts on failure
             retry_delay: Time to wait between retries (timedelta)
+            params: Parameters to pass to the subflow
+            name: Human-readable name for the subflow
+            description: Description of what the subflow does
 
         Returns:
             Decorator function
 
         Example:
             ```python
-            @flow.subflow("process_batch", depends_on=["extract"])
+            @flow.subflow("process_batch", depends_on=["extract"], name="Batch Processor", description="Processes batches in parallel")
             def get_batch_flow(ctx: Context):
                 return batch_processing_flow
             ```
-            :param params:
         """
 
         def decorator(child_flow_fn: Callable):
@@ -255,6 +283,8 @@ class AsyncFlow:
                 max_retries=max_retries,
                 retry_delay=retry_delay,
                 params=params,
+                name=name,
+                description=description,
             )
             return child_flow_fn
 
@@ -619,6 +649,8 @@ class AsyncFlow:
                 task_type=task_def.task_type,
                 dependencies=task_def.dependencies,
                 max_retries=task_def.max_retries,
+                name=task_def.name,
+                description=task_def.description,
             )
 
         for subflow_id, subflow_def in flow_def._subflow_definitions.items():
@@ -628,6 +660,8 @@ class AsyncFlow:
                 dependencies=subflow_def.dependencies,
                 max_retries=subflow_def.max_retries,
                 flow_name=subflow_def.child_flow.flow_name,
+                name=subflow_def.name,
+                description=subflow_def.description,
             )
 
         flow_definition = FlowDefinitionSchema(
@@ -696,6 +730,297 @@ class AsyncFlow:
             parent_task_id=workflow_run.parent_task_id,
             flow_definition=flow_definition,
             task_executions=task_exec_schemas,
+        )
+
+    def get_flat_execution_details(self, run_id: str) -> FlatExecutionSchema:
+        """
+        Get flattened execution details optimized for UI consumption.
+
+        All tasks (including subflows) are flattened to a single level and sorted by start_timestamp.
+        Dependencies are explicitly listed as source->target pairs.
+
+        Args:
+            run_id: ID of the workflow run
+
+        Returns:
+            Flattened execution schema
+        """
+        # First get the hierarchical execution details
+        execution_details = self.get_execution_details(run_id)
+        workflow_run = self._store.load(run_id)
+
+        # Flatten tasks recursively
+        flat_tasks = self._flatten_tasks_recursive(
+            execution_details.task_executions,
+            execution_details.flow_definition.tasks,
+            parent_path=""
+        )
+
+        # Sort by start_timestamp
+        flat_tasks.sort(key=lambda t: t.start_timestamp if t.start_timestamp else "")
+
+        # Extract dependencies
+        dependencies = self._extract_dependencies_recursive(
+            execution_details.task_executions,
+            execution_details.flow_definition.tasks,
+            parent_path=""
+        )
+
+        # Calculate statistics
+        total_tasks = len(flat_tasks)
+        successful_tasks = sum(1 for t in flat_tasks if t.state == "success")
+        failed_tasks = sum(1 for t in flat_tasks if t.state == "failed")
+        running_tasks = sum(1 for t in flat_tasks if t.state == "running")
+
+        # Calculate duration
+        duration_ms = None
+        if workflow_run.start_date and workflow_run.end_date:
+            delta = workflow_run.end_date - workflow_run.start_date
+            duration_ms = delta.total_seconds() * 1000
+
+        return FlatExecutionSchema(
+            run_id=workflow_run.id,
+            flow_name=workflow_run.flow_name,
+            params=workflow_run.params,
+            state=workflow_run.state,
+            start_timestamp=workflow_run.start_date.isoformat() if workflow_run.start_date else None,
+            end_timestamp=workflow_run.end_date.isoformat() if workflow_run.end_date else None,
+            duration_ms=duration_ms,
+            parent_run_id=workflow_run.parent_run_id,
+            parent_task_id=workflow_run.parent_task_id,
+            tasks=flat_tasks,
+            dependencies=dependencies,
+            total_tasks=total_tasks,
+            successful_tasks=successful_tasks,
+            failed_tasks=failed_tasks,
+            running_tasks=running_tasks,
+        )
+
+    def _flatten_tasks_recursive(
+            self,
+            task_executions: Dict[str, TaskExecutionSchema],
+            task_definitions: Dict[str, TaskDefinitionSchema],
+            parent_path: str
+    ) -> List[FlatTaskSchema]:
+        """
+        Recursively flatten all tasks including subflows.
+
+        Args:
+            task_executions: Task executions to flatten
+            task_definitions: Task definitions
+            parent_path: Path prefix for task IDs
+
+        Returns:
+            List of flattened tasks
+        """
+        flat_tasks = []
+
+        for task_id, task_exec in task_executions.items():
+            # Build full path
+            full_task_id = f"{parent_path}.{task_id}" if parent_path else task_id
+
+            # Calculate duration
+            duration_ms = None
+            if task_exec.start_timestamp and task_exec.end_timestamp:
+                from datetime import datetime
+                start = datetime.fromisoformat(task_exec.start_timestamp)
+                end = datetime.fromisoformat(task_exec.end_timestamp)
+                duration_ms = (end - start).total_seconds() * 1000
+
+            # Get name and description from task definition
+            name = None
+            description = None
+            if task_id in task_definitions:
+                name = task_definitions[task_id].name
+                description = task_definitions[task_id].description
+
+            # Create flat task
+            flat_task = FlatTaskSchema(
+                id=task_exec.id,
+                task_id=full_task_id,
+                task_type=task_exec.task_type,
+                state=task_exec.state,
+                attempt_number=task_exec.attempt_number,
+                name=name,
+                description=description,
+                input_data=task_exec.input_data,
+                output_data=task_exec.output_data,
+                error_message=task_exec.error_message,
+                start_timestamp=task_exec.start_timestamp,
+                end_timestamp=task_exec.end_timestamp,
+                duration_ms=duration_ms
+            )
+            flat_tasks.append(flat_task)
+
+            # Recursively flatten subflow tasks
+            if task_exec.subflow_execution:
+                subflow_tasks = self._flatten_tasks_recursive(
+                    task_exec.subflow_execution.task_executions,
+                    task_exec.subflow_execution.flow_definition.tasks,
+                    parent_path=full_task_id
+                )
+                flat_tasks.extend(subflow_tasks)
+
+        return flat_tasks
+
+    def _extract_dependencies_recursive(
+            self,
+            task_executions: Dict[str, TaskExecutionSchema],
+            task_definitions: Dict[str, TaskDefinitionSchema],
+            parent_path: str
+    ) -> List[TaskDependencySchema]:
+        """
+        Recursively extract all dependencies.
+
+        Args:
+            task_executions: Task executions
+            task_definitions: Task definitions with dependency info
+            parent_path: Path prefix for task IDs
+
+        Returns:
+            List of dependencies
+        """
+        dependencies = []
+
+        for task_id, task_def in task_definitions.items():
+            full_task_id = f"{parent_path}.{task_id}" if parent_path else task_id
+
+            # Extract dependencies for this task
+            for dep_id in task_def.dependencies:
+                full_dep_id = f"{parent_path}.{dep_id}" if parent_path else dep_id
+
+                # Get source output, input and real instance IDs
+                source_output = None
+                target_input = None
+                source_id = None
+                target_id = None
+
+                if dep_id in task_executions:
+                    source_output = task_executions[dep_id].output_data
+                    source_id = task_executions[dep_id].id  # Real instance ID
+
+                if task_id in task_executions:
+                    target_input = task_executions[task_id].input_data
+                    target_id = task_executions[task_id].id  # Real instance ID
+
+                dependencies.append(TaskDependencySchema(
+                    source=full_dep_id,
+                    target=full_task_id,
+                    source_id=source_id,
+                    target_id=target_id,
+                    source_output=source_output,
+                    target_input=target_input
+                ))
+
+            # Recursively extract subflow dependencies
+            if task_id in task_executions:
+                task_exec = task_executions[task_id]
+                if task_exec.subflow_execution:
+                    sub_deps = self._extract_dependencies_recursive(
+                        task_exec.subflow_execution.task_executions,
+                        task_exec.subflow_execution.flow_definition.tasks,
+                        parent_path=full_task_id
+                    )
+                    dependencies.extend(sub_deps)
+
+        return dependencies
+
+    @staticmethod
+    def list_all_jobs(store: Store) -> JobListResponseSchema:
+        """
+        List all jobs with aggregated statistics.
+
+        This is a static method that can be used without a flow instance.
+
+        Args:
+            store: The store to query for workflow runs
+
+        Returns:
+            JobListResponseSchema with job summaries and aggregated stats
+        """
+        # Get all runs from store
+        all_runs = store.get_all_runs(include_tasks=True)
+
+        # Build job summaries
+        job_summaries = []
+        total_duration = 0.0
+        duration_count = 0
+
+        # Stats counters
+        running_count = 0
+        success_count = 0
+        failed_count = 0
+        pending_count = 0
+        total_tasks_all = 0
+
+        for run in all_runs:
+            # Calculate duration
+            duration_ms = None
+            if run.start_date and run.end_date:
+                delta = run.end_date - run.start_date
+                duration_ms = delta.total_seconds() * 1000
+                total_duration += duration_ms
+                duration_count += 1
+
+            # Calculate task statistics
+            tasks = run.tasks or {}
+            total_tasks = len(tasks)
+            successful_tasks = sum(1 for t in tasks.values() if t.state == "success")
+            failed_tasks = sum(1 for t in tasks.values() if t.state == "failed")
+            running_tasks = sum(1 for t in tasks.values() if t.state == "running")
+            pending_tasks = sum(1 for t in tasks.values() if t.state == "scheduled")
+
+            total_tasks_all += total_tasks
+
+            # Count job states
+            if run.state == "running":
+                running_count += 1
+            elif run.state == "success":
+                success_count += 1
+            elif run.state == "failed":
+                failed_count += 1
+            elif run.state == "scheduled":
+                pending_count += 1
+
+            # Create job summary
+            job_summary = JobSummarySchema(
+                run_id=run.id,
+                flow_name=run.flow_name,
+                state=run.state,
+                start_timestamp=run.start_date.isoformat() if run.start_date else None,
+                end_timestamp=run.end_date.isoformat() if run.end_date else None,
+                duration_ms=duration_ms,
+                parent_run_id=run.parent_run_id,
+                total_tasks=total_tasks,
+                successful_tasks=successful_tasks,
+                failed_tasks=failed_tasks,
+                running_tasks=running_tasks,
+                pending_tasks=pending_tasks,
+            )
+            job_summaries.append(job_summary)
+
+        # Calculate average duration
+        avg_duration = total_duration / duration_count if duration_count > 0 else None
+
+        # Build aggregated stats
+        stats = JobListStatsSchema(
+            total_jobs=len(all_runs),
+            running_jobs=running_count,
+            successful_jobs=success_count,
+            failed_jobs=failed_count,
+            pending_jobs=pending_count,
+            total_tasks_across_all_jobs=total_tasks_all,
+            total_duration_ms=total_duration if duration_count > 0 else None,
+            average_duration_ms=avg_duration,
+        )
+
+        # Sort jobs by start date (most recent first)
+        job_summaries.sort(key=lambda j: j.start_timestamp or "", reverse=True)
+
+        return JobListResponseSchema(
+            jobs=job_summaries,
+            stats=stats,
+            total_count=len(job_summaries),
         )
 
     # ================================================================
