@@ -5,7 +5,7 @@ Main exports:
 - AsyncFlow: The main workflow orchestration engine
 - Context: Execution context for task functions
 - ExecutionState: Workflow and task execution states
-- Store: Storage protocol (SQLiteStore, JsonStore)
+- Store: Storage protocol (SQLStore, JsonStore)
 
 Workflow builders:
 - FlowBuilder: Fluent builder pattern for programmatic workflow construction
@@ -21,7 +21,7 @@ from app.infra.flow.models import (
     WorkflowRun,
     TaskInstance,
 )
-from app.infra.flow.sqlite_store import SQLiteStore
+from app.infra.flow.store.sql_store import SQLStore
 from app.infra.flow.workflow_builders import FlowBuilder
 
 __all__ = [
@@ -37,7 +37,7 @@ __all__ = [
     "TaskInstance",
     # Storage
     "Store",
-    "SQLiteStore",
+    "SQLStore",
     # Workflow builders
     "FlowBuilder",
 ]

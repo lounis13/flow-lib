@@ -118,7 +118,7 @@ class TaskExecutor(ABC):
             task_instance.state = state
             for key, value in kwargs.items():
                 setattr(task_instance, key, value)
-            self.store.save(workflow_run)
+                self.store.update_task(workflow_run.id, task_instance)
 
     async def _handle_task_failure(
         self,
@@ -149,11 +149,11 @@ class TaskExecutor(ABC):
 
             if task_instance.try_number <= max_retries:
                 task_instance.state = ExecutionState.SCHEDULED
-                self.store.save(workflow_run)
+                self.store.update_task(workflow_run.id, task_instance)
                 return retry_delay_seconds if retry_delay_seconds else 0
             else:
                 task_instance.state = ExecutionState.FAILED
-                self.store.save(workflow_run)
+                self.store.update_task(workflow_run.id, task_instance)
                 return None
 
     @abstractmethod
@@ -225,7 +225,7 @@ class StandardTaskExecutor(TaskExecutor):
                 return
             task_instance.state = ExecutionState.RUNNING
             task_instance.start_date = datetime.now()
-            self.store.save(workflow_run)
+            self.store.update_task(workflow_run.id, task_instance)
 
         # Execute task
         context = Context(workflow_run, task_instance)
@@ -349,7 +349,7 @@ class SubFlowExecutor(TaskExecutor):
                             merged_params[dependency_id] = dependency_task.output_json
                 task_instance.input_json = {**task_instance.input_json, **merged_params}
 
-            self.store.save(workflow_run)
+            self.store.update_task(workflow_run.id, task_instance)
 
         # Execute subflow
         try:

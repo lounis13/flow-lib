@@ -355,7 +355,7 @@ class Store(Protocol):
     """
     Protocol defining the storage interface for workflow persistence.
 
-    Implementations include SQLiteStore, JsonStore, and MemoryStore.
+    Implementations include SQLStore, JsonStore, and MemoryStore.
     """
 
     def open(self) -> None:
@@ -418,26 +418,7 @@ class Store(Protocol):
         """
         ...
 
-    def list_runs(self) -> List[str]:
-        """
-        List all workflow run IDs in storage.
 
-        Returns:
-            List of run IDs, ordered by start date (most recent first)
-        """
-        ...
-
-    def list_children(self, parent_run_id: str) -> List[str]:
-        """
-        List all child workflow runs of a parent run.
-
-        Args:
-            parent_run_id: ID of the parent workflow run
-
-        Returns:
-            List of child run IDs
-        """
-        ...
 
     def get_all_runs(self, include_tasks: bool = True) -> List[WorkflowRun]:
         """

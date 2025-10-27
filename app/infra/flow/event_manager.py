@@ -291,8 +291,7 @@ class WorkflowEventHandler:
                 if task_instance and task_instance.state == ExecutionState.SCHEDULED:
                     task_instance.state = ExecutionState.SKIPPED
                     task_instance.end_date = now
-
-            self.store.save(workflow_run)
+                    self.store.update_task(workflow_run.id, task_instance)
 
     def is_workflow_complete(self, workflow_run: WorkflowRun) -> bool:
         """

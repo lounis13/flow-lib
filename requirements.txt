@@ -1,3 +1,5 @@
+sqlmodel
+sqlalchemy
 # Core Python dependencies for night-batch flow library
 # Python >= 3.10 required
 

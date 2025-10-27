@@ -8,7 +8,7 @@ import asyncio
 import pytest
 from typing import Any, Callable, Dict, List, Optional
 
-from app.infra.flow import AsyncFlow, SQLiteStore, Context, ExecutionState
+from app.infra.flow import AsyncFlow, SQLStore, Context, ExecutionState
 
 
 # ============================================================
@@ -27,10 +27,10 @@ def store(tmp_path):
         tmp_path: Pytest fixture providing temporary directory
 
     Yields:
-        SQLiteStore: Opened store instance
+        SQLStore: Opened store instance
     """
     db_path = tmp_path / "test_flow.db"
-    store = SQLiteStore(str(db_path))
+    store = SQLStore(f"sqlite:///{db_path}")
     store.open()
     yield store
     store.close()
@@ -146,7 +146,7 @@ def create_counter_task() -> tuple[Callable[[Context], int], list]:
 
 async def run_and_assert(
     flow: AsyncFlow,
-    store: SQLiteStore,
+    store: SQLStore,
     expected_state: str,
     **params
 ) -> Any:
@@ -182,7 +182,7 @@ async def run_and_assert(
 
 
 def build_workflow(
-    store: SQLiteStore,
+    store: SQLStore,
     flow_name: str,
     tasks_spec: List[Dict[str, Any]]
 ) -> AsyncFlow:

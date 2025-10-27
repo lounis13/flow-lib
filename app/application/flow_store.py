@@ -1,4 +1,4 @@
-from app.infra.flow import SQLiteStore
+from app.infra.flow import SQLStore
 
-store = SQLiteStore("nb.db")
+store = SQLStore("sqlite:///nb.db")
 store.open()
