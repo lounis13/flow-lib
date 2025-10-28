@@ -8,6 +8,7 @@ including task completion events and workflow coordination.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import Callable, Dict, List, Any
 
@@ -19,6 +20,9 @@ from app.infra.flow.models import (
     WorkflowEvent,
     WorkflowRun,
 )
+
+# Configure logger for event manager
+logger = logging.getLogger(__name__)
 
 
 class EventManager:
@@ -53,6 +57,10 @@ class EventManager:
         Args:
             event: Event to emit
         """
+        logger.debug(
+            f"Emitting event: type={event.event_type}, run_id={event.run_id}, "
+            f"task_id={getattr(event, 'task_id', 'N/A')}"
+        )
         queue = self.get_event_queue(event.run_id)
         await queue.put(event)
 
@@ -154,11 +162,14 @@ class DependencyResolver:
         Returns:
             List of task IDs that are ready to execute
         """
-        return [
+        ready_tasks = [
             task_id
             for task_id in self.task_definitions.keys()
             if self.is_task_ready(workflow_run, task_id)
         ]
+        if ready_tasks:
+            logger.debug(f"Ready tasks: run_id={workflow_run.id}, tasks={ready_tasks}")
+        return ready_tasks
 
     def get_ready_subflows(self, workflow_run: WorkflowRun) -> List[str]:
         """
@@ -170,11 +181,14 @@ class DependencyResolver:
         Returns:
             List of subflow IDs that are ready to execute
         """
-        return [
+        ready_subflows = [
             subflow_id
             for subflow_id in self.subflow_definitions.keys()
             if self.is_subflow_ready(workflow_run, subflow_id)
         ]
+        if ready_subflows:
+            logger.debug(f"Ready subflows: run_id={workflow_run.id}, subflows={ready_subflows}")
+        return ready_subflows
 
     def get_downstream_tasks(self, task_id: str) -> List[str]:
         """
@@ -262,10 +276,24 @@ class WorkflowEventHandler:
             task_id: ID of the completed task
         """
         # Find and launch ready downstream tasks
-        for downstream_task_id in self.dependency_resolver.get_downstream_tasks(task_id):
+        downstream_tasks = self.dependency_resolver.get_downstream_tasks(task_id)
+        logger.debug(
+            f"Task completion handler: run_id={workflow_run.id}, task_id={task_id}, "
+            f"downstream={downstream_tasks}"
+        )
+
+        for downstream_task_id in downstream_tasks:
             if self.dependency_resolver.is_task_ready(workflow_run, downstream_task_id):
+                logger.debug(
+                    f"Launching ready downstream task: run_id={workflow_run.id}, "
+                    f"task_id={downstream_task_id}"
+                )
                 self.task_launcher(workflow_run, downstream_task_id)
             elif self.dependency_resolver.is_subflow_ready(workflow_run, downstream_task_id):
+                logger.debug(
+                    f"Launching ready downstream subflow: run_id={workflow_run.id}, "
+                    f"subflow_id={downstream_task_id}"
+                )
                 self.task_launcher(workflow_run, downstream_task_id)
 
     async def handle_task_failure(
@@ -283,6 +311,11 @@ class WorkflowEventHandler:
         """
         # Get ALL downstream tasks transitively (not just direct dependencies)
         downstream_task_ids = self.dependency_resolver.get_all_downstream_tasks(task_id)
+
+        logger.debug(
+            f"Task failure handler: run_id={workflow_run.id}, task_id={task_id}, "
+            f"skipping_downstream={downstream_task_ids}"
+        )
         now = datetime.now()
 
         async with run_lock:

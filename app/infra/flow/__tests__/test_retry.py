@@ -679,6 +679,131 @@ async def test_manual_retry_multiple_times(store):
 
 
 @pytest.mark.asyncio
+async def test_retry_nested_task_with_parent_run_id(store):
+    """
+    Test: Retry a task in a nested subflow using parent run_id.
+
+    Scenario:
+    - User has parent run_id
+    - User wants to retry "sub1.sub2.deep_task"
+    - System should:
+      1. Find the task in nested subflow
+      2. Reset the task to SCHEDULED
+      3. Set all parent flows (sub2, sub1) to RUNNING
+      4. Resume execution from that task
+      5. Continue propagating success up to parent
+
+    Structure:
+        parent
+          → sub1
+              → sub2
+                  → deep_task (fails)
+                  → process (depends on deep_task)
+              → aggregate (depends on sub2)
+          → finalize (depends on sub1)
+
+    Verifies:
+    - Retry with parent run_id and nested task_id works
+    - All parent flows are set to RUNNING
+    - Execution continues from the failed task
+    - Downstream tasks in the same subflow execute
+    - Parent workflows continue after subflow completes
+    """
+    attempt_counter = {"count": 0}
+
+    def flaky_deep_task(ctx: Context):
+        attempt_counter["count"] += 1
+        if attempt_counter["count"] == 1:
+            raise ValueError("Deep task fails")
+        return "deep_result"
+
+    # Level 2: sub2 (deepest)
+    sub2 = AsyncFlow("sub2")
+
+    @sub2.task("deep_task", max_retries=0)
+    def deep_task(ctx: Context):
+        return flaky_deep_task(ctx)
+
+    @sub2.task("process", depends_on=["deep_task"])
+    def process(ctx: Context):
+        data = ctx.pull("deep_task")
+        return f"processed_{data}"
+
+    # Level 1: sub1
+    sub1 = AsyncFlow("sub1")
+
+    @sub1.subflow("sub2")
+    def run_sub2(ctx: Context):
+        return sub2
+
+    @sub1.task("aggregate", depends_on=["sub2"])
+    def aggregate(ctx: Context):
+        result = ctx.pull("sub2")
+        return f"aggregated_{result}"
+
+    # Level 0: parent
+    parent = AsyncFlow("parent")
+
+    @parent.subflow("sub1")
+    def run_sub1(ctx: Context):
+        return sub1
+
+    @parent.task("finalize", depends_on=["sub1"])
+    def finalize(ctx: Context):
+        result = ctx.pull("sub1")
+        return f"final_{result}"
+
+    # Set up stores
+    parent._store = store
+    sub1._store = store
+    sub2._store = store
+
+    # Run parent workflow
+    parent_run_id = parent.init_run()
+    await parent.run_until_complete(parent_run_id)
+
+    # Verify initial failure
+    parent_run = store.load(parent_run_id)
+    assert parent_run.state == ExecutionState.FAILED
+
+    # Get all tasks recursively to verify the nested task path exists
+    all_tasks = parent_run.get_all_tasks_recursive(store)
+    assert "sub1.sub2.deep_task" in all_tasks
+    assert all_tasks["sub1.sub2.deep_task"].state == ExecutionState.FAILED
+    assert "sub1.sub2.process" in all_tasks
+    assert all_tasks["sub1.sub2.process"].state in [ExecutionState.SCHEDULED, ExecutionState.SKIPPED]
+    assert "sub1.aggregate" in all_tasks
+    assert all_tasks["sub1.aggregate"].state in [ExecutionState.SCHEDULED, ExecutionState.SKIPPED]
+
+    # THIS IS THE KEY TEST: Retry using parent run_id with nested task_id
+    # The user only knows the parent run_id and the full task path
+    await parent.retry(
+        run_id=parent_run_id,
+        task_id="sub1.sub2.deep_task",
+        reset_downstream=True
+    )
+
+    # Verify everything completed
+    parent_run = store.load(parent_run_id)
+    all_tasks_after = parent_run.get_all_tasks_recursive(store)
+
+    # The nested task should be SUCCESS
+    assert all_tasks_after["sub1.sub2.deep_task"].state == ExecutionState.SUCCESS
+
+    # Downstream tasks in the same subflow should execute
+    assert all_tasks_after["sub1.sub2.process"].state == ExecutionState.SUCCESS
+
+    # Parent subflow tasks should execute
+    assert all_tasks_after["sub1.aggregate"].state == ExecutionState.SUCCESS
+
+    # Top-level parent tasks should execute
+    assert parent_run.tasks["finalize"].state == ExecutionState.SUCCESS
+
+    # Overall workflow should be SUCCESS
+    assert parent_run.state == ExecutionState.SUCCESS
+
+
+@pytest.mark.asyncio
 async def test_retry_diamond_pattern(store):
     """
     Test: Retry in diamond pattern with downstream reset.

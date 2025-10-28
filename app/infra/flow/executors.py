@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import traceback
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -26,6 +27,9 @@ from app.infra.flow.models import (
     EventType,
     Store,
 )
+
+# Configure logger for executors
+logger = logging.getLogger(__name__)
 
 
 class TaskExecutor(ABC):
@@ -127,6 +131,7 @@ class TaskExecutor(ABC):
         max_retries: int,
         retry_delay_seconds: Optional[float],
         run_lock: asyncio.Lock,
+        exception: Optional[Exception] = None,
     ) -> Optional[float]:
         """
         Handle task failure and determine if retry is needed.
@@ -137,6 +142,7 @@ class TaskExecutor(ABC):
             max_retries: Maximum number of retry attempts
             retry_delay_seconds: Delay in seconds before retry
             run_lock: Lock for the workflow run
+            exception: The exception that caused the failure (for logging)
 
         Returns:
             Delay in seconds before retry, or None if no retry should occur
@@ -144,15 +150,30 @@ class TaskExecutor(ABC):
         async with run_lock:
             task_instance = workflow_run.tasks[task_id]
             task_instance.try_number += 1
-            task_instance.error = traceback.format_exc()
+            error_traceback = traceback.format_exc()
+            task_instance.error = error_traceback
             task_instance.end_date = datetime.now()
 
+            # Log the error with context
             if task_instance.try_number <= max_retries:
                 task_instance.state = ExecutionState.SCHEDULED
+                logger.warning(
+                    f"Task failed: run_id={workflow_run.id}, task_id={task_id}, "
+                    f"attempt={task_instance.try_number}/{max_retries + 1}, "
+                    f"retry_in={retry_delay_seconds}s. "
+                    f"Error: {exception.__class__.__name__}: {str(exception)}"
+                )
+                logger.debug(f"Full traceback for {workflow_run.id}::{task_id}:\n{error_traceback}")
                 self.store.update_task(workflow_run.id, task_instance)
                 return retry_delay_seconds if retry_delay_seconds else 0
             else:
                 task_instance.state = ExecutionState.FAILED
+                logger.error(
+                    f"Task failed permanently: run_id={workflow_run.id}, task_id={task_id}, "
+                    f"attempts={task_instance.try_number}/{max_retries + 1}. "
+                    f"Error: {exception.__class__.__name__}: {str(exception)}"
+                )
+                logger.debug(f"Full traceback for {workflow_run.id}::{task_id}:\n{error_traceback}")
                 self.store.update_task(workflow_run.id, task_instance)
                 return None
 
@@ -222,10 +243,19 @@ class StandardTaskExecutor(TaskExecutor):
         async with run_lock:
             task_instance = workflow_run.tasks[task_id]
             if task_instance.state != ExecutionState.SCHEDULED:
+                logger.debug(
+                    f"Task not scheduled, skipping: run_id={run_id}, task_id={task_id}, "
+                    f"current_state={task_instance.state}"
+                )
                 return
             task_instance.state = ExecutionState.RUNNING
             task_instance.start_date = datetime.now()
             self.store.update_task(workflow_run.id, task_instance)
+
+        logger.debug(
+            f"Starting task execution: run_id={run_id}, task_id={task_id}, "
+            f"attempt={task_instance.try_number + 1}"
+        )
 
         # Execute task
         context = Context(workflow_run, task_instance)
@@ -245,6 +275,12 @@ class StandardTaskExecutor(TaskExecutor):
                 end_date=datetime.now(),
             )
 
+            # Log success
+            logger.info(
+                f"Task completed successfully: run_id={run_id}, task_id={task_id}, "
+                f"attempt={workflow_run.tasks[task_id].try_number + 1}"
+            )
+
             # Emit success event
             await event_emitter(
                 TaskEvent(
@@ -254,7 +290,7 @@ class StandardTaskExecutor(TaskExecutor):
                 )
             )
 
-        except Exception:
+        except Exception as e:
             # Handle failure and retry
             retry_delay = await self._handle_task_failure(
                 workflow_run,
@@ -264,6 +300,7 @@ class StandardTaskExecutor(TaskExecutor):
                 if self.task_definition.retry_delay
                 else None,
                 run_lock,
+                exception=e,
             )
 
             if retry_delay is not None:
@@ -328,9 +365,18 @@ class SubFlowExecutor(TaskExecutor):
         async with run_lock:
             task_instance = workflow_run.tasks[task_id]
             if task_instance.state != ExecutionState.SCHEDULED:
+                logger.debug(
+                    f"Subflow not scheduled, skipping: run_id={run_id}, subflow_id={task_id}, "
+                    f"current_state={task_instance.state}"
+                )
                 return
             task_instance.state = ExecutionState.RUNNING
             task_instance.start_date = datetime.now()
+
+            logger.debug(
+                f"Starting subflow execution: run_id={run_id}, subflow_id={task_id}, "
+                f"attempt={task_instance.try_number + 1}"
+            )
 
             # Prepare input parameters on first attempt
             if task_instance.try_number == 0:
@@ -361,6 +407,11 @@ class SubFlowExecutor(TaskExecutor):
             )
             if not child_run_id:
                 raise RuntimeError(f"No child_run_id found for subflow {task_id}")
+
+            logger.debug(
+                f"Executing child flow: parent_run_id={run_id}, subflow_id={task_id}, "
+                f"child_run_id={child_run_id}, params={task_instance.input_json}"
+            )
 
             # Configure and execute child flow
             child_flow = self.subflow_definition.child_flow
@@ -422,6 +473,13 @@ class SubFlowExecutor(TaskExecutor):
                     run_lock,
                     end_date=datetime.now(),
                 )
+
+                # Log subflow success
+                logger.info(
+                    f"Subflow completed successfully: run_id={run_id}, subflow_id={task_id}, "
+                    f"child_run_id={child_run_id}"
+                )
+
                 await event_emitter(
                     TaskEvent(
                         event_type=EventType.TASK_COMPLETED,
@@ -432,7 +490,7 @@ class SubFlowExecutor(TaskExecutor):
             else:
                 raise RuntimeError(f"Subflow {task_id} failed")
 
-        except Exception:
+        except Exception as e:
             # Handle failure and retry
             retry_delay = await self._handle_task_failure(
                 workflow_run,
@@ -442,6 +500,7 @@ class SubFlowExecutor(TaskExecutor):
                 if self.subflow_definition.retry_delay
                 else None,
                 run_lock,
+                exception=e,
             )
 
             if retry_delay is not None:

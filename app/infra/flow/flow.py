@@ -13,6 +13,7 @@ and executing directed acyclic graphs (DAGs) of tasks with support for:
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -46,6 +47,9 @@ from app.infra.flow.models import (
     JobListResponseSchema,
 )
 from app.infra.flow.retry_manager import RetryManager
+
+# Configure logger for flow
+logger = logging.getLogger(__name__)
 
 
 class AsyncFlow:
@@ -434,6 +438,11 @@ class AsyncFlow:
         """
         workflow_run = self._store.load(run_id)
 
+        logger.info(
+            f"Starting workflow execution: run_id={run_id}, flow_name={self.flow_name}, "
+            f"max_concurrency={max_concurrency if max_concurrency > 0 else 'unlimited'}"
+        )
+
         # Mark workflow as running
         async with self._get_run_lock(run_id):
             workflow_run.state = ExecutionState.RUNNING
@@ -461,11 +470,17 @@ class AsyncFlow:
             while True:
                 event = await event_queue.get()
 
+                logger.debug(
+                    f"Processing event: type={event.event_type}, run_id={run_id}, "
+                    f"task_id={getattr(event, 'task_id', 'N/A')}"
+                )
+
                 if event.event_type == EventType.TASK_COMPLETED:
                     await self._handle_task_completion(workflow_run, event.task_id)
                 elif event.event_type == EventType.TASK_FAILED:
                     await self._handle_task_failure(workflow_run, event.task_id)
                 elif event.event_type == EventType.WORKFLOW_EXIT:
+                    logger.debug(f"Workflow exit event received: run_id={run_id}")
                     break
 
                 # Check if workflow is complete
@@ -476,11 +491,17 @@ class AsyncFlow:
                     async with self._get_run_lock(run_id):
                         # Use the checked instance for final state
                         workflow_run = workflow_run_check
-                        workflow_run.state = event_handler.compute_workflow_final_state(
-                            workflow_run
-                        )
+                        final_state = event_handler.compute_workflow_final_state(workflow_run)
+                        workflow_run.state = final_state
                         workflow_run.end_date = datetime.now()
                         self._store.save(workflow_run)
+
+                        # Log workflow completion
+                        logger.info(
+                            f"Workflow completed: run_id={run_id}, flow_name={self.flow_name}, "
+                            f"final_state={final_state}"
+                        )
+
                     await self._event_manager.emit_event(
                         WorkflowExitEvent(
                             event_type=EventType.WORKFLOW_EXIT, run_id=run_id
@@ -553,6 +574,7 @@ class AsyncFlow:
             workflow_run: The workflow run (shared instance)
             task_id: ID of the completed task
         """
+        logger.debug(f"Handling task completion: run_id={workflow_run.id}, task_id={task_id}")
         event_handler = self._create_event_handler()
         await event_handler.handle_task_completion(workflow_run, task_id)
 
@@ -566,6 +588,7 @@ class AsyncFlow:
             workflow_run: The workflow run (shared instance)
             task_id: ID of the failed task
         """
+        logger.debug(f"Handling task failure: run_id={workflow_run.id}, task_id={task_id}")
         event_handler = self._create_event_handler()
         await event_handler.handle_task_failure(
             workflow_run, task_id, self._get_run_lock(workflow_run.id)

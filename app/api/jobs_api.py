@@ -89,7 +89,7 @@ async def retry_task(job_id: str, retry_request: RetryRequest, background_tasks:
     # Load job and rebuild flow
     try:
         job = store.load(job_id)
-        flow = build_night_batch_flow(job.params) if job.flow_name == "Night Batch Flow" else build_pricing_flow("Pricing")
+        flow = build_night_batch_flow(job.params)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load job: {str(e)}")
 

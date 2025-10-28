@@ -7,6 +7,7 @@ and subflows, including downstream task reset capabilities.
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from app.infra.flow.models import (
@@ -17,6 +18,9 @@ from app.infra.flow.models import (
     TaskType,
     WorkflowRun,
 )
+
+# Configure logger for retry manager
+logger = logging.getLogger(__name__)
 
 
 class RetryManager:
@@ -153,10 +157,11 @@ class RetryManager:
         Manually retry a failed task.
 
         This resets the task state and optionally resets all downstream tasks.
+        Supports hierarchical task IDs (e.g., "ftb_flow.pricing_flow.calculate_price").
 
         Args:
             run_id: ID of the workflow run
-            task_id: ID of the task to retry
+            task_id: ID of the task to retry (can be nested path)
             reset_downstream: Whether to also reset downstream tasks
 
         Raises:
@@ -164,19 +169,162 @@ class RetryManager:
         """
         workflow_run = self.store.load(run_id)
 
-        # Reset the target task
-        self.reset_task_state(workflow_run, task_id)
+        logger.info(
+            f"Manual retry initiated: run_id={run_id}, task_id={task_id}, "
+            f"reset_downstream={reset_downstream}"
+        )
 
-        # Reset workflow state if it was terminal
-        if ExecutionState.is_terminal(workflow_run.state):
-            workflow_run.state = ExecutionState.RUNNING
-            workflow_run.end_date = None
+        # Check if this is a hierarchical task ID (contains ".")
+        if "." in task_id:
+            self._retry_hierarchical_task(workflow_run, task_id, reset_downstream)
+            logger.info(
+                f"Hierarchical retry completed: run_id={run_id}, task_id={task_id}"
+            )
+        else:
+            # Simple case: task is at the current level
+            self.reset_task_state(workflow_run, task_id)
 
-        # Optionally reset downstream tasks
-        if reset_downstream and self.downstream_resolver:
-            self.reset_downstream_tasks(workflow_run, task_id)
+            # Reset workflow state if it was terminal
+            if ExecutionState.is_terminal(workflow_run.state):
+                workflow_run.state = ExecutionState.RUNNING
+                workflow_run.end_date = None
 
-        self.store.save(workflow_run)
+            # Optionally reset downstream tasks
+            if reset_downstream and self.downstream_resolver:
+                self.reset_downstream_tasks(workflow_run, task_id)
+
+            self.store.save(workflow_run)
+            logger.info(
+                f"Manual retry completed: run_id={run_id}, task_id={task_id}"
+            )
+
+    def _retry_hierarchical_task(
+        self,
+        workflow_run: WorkflowRun,
+        hierarchical_task_id: str,
+        reset_downstream: bool,
+    ) -> None:
+        """
+        Retry a task in a nested subflow using hierarchical task ID.
+
+        This method:
+        1. Parses the hierarchical path (e.g., "ftb_flow.pricing_flow.calculate_price")
+        2. Navigates through subflows to find the target task
+        3. Resets all parent subflows to RUNNING
+        4. Resets the target task to SCHEDULED
+        5. Optionally resets downstream tasks in the target subflow
+
+        Args:
+            workflow_run: The parent workflow run
+            hierarchical_task_id: Full path to the task (e.g., "sub1.sub2.task")
+            reset_downstream: Whether to reset downstream tasks
+
+        Raises:
+            KeyError: If any part of the path doesn't exist
+        """
+        # Parse the hierarchical path
+        path_parts = hierarchical_task_id.split(".")
+
+        # Navigate through the hierarchy
+        current_run = workflow_run
+        subflow_chain = []  # Track (run, subflow_task_id) pairs to set to RUNNING
+
+        # Navigate to the deepest subflow containing the target task
+        for i, part in enumerate(path_parts[:-1]):  # All parts except the last (task name)
+            # Check if this part is a subflow in the current run
+            if part not in current_run.tasks:
+                raise KeyError(
+                    f"Subflow '{part}' not found in run '{current_run.id}'. "
+                    f"Available tasks: {list(current_run.tasks.keys())}"
+                )
+
+            subflow_task = current_run.tasks[part]
+            if subflow_task.type != TaskType.FLOW:
+                raise KeyError(
+                    f"Task '{part}' is not a subflow (type: {subflow_task.type})"
+                )
+
+            # Track this subflow for later state update
+            subflow_chain.append((current_run, part))
+
+            # Get child run ID
+            if not subflow_task.output_json or "child_run_id" not in subflow_task.output_json:
+                raise KeyError(
+                    f"Subflow '{part}' has no child_run_id. "
+                    f"Output: {subflow_task.output_json}"
+                )
+
+            child_run_id = subflow_task.output_json["child_run_id"]
+            current_run = self.store.load(child_run_id)
+
+        # Now current_run is the deepest subflow, and path_parts[-1] is the task name
+        target_task_id = path_parts[-1]
+
+        # Reset the target task in the deepest subflow
+        self.reset_task_state(current_run, target_task_id)
+
+        # Reset the deepest subflow state if it was terminal
+        if ExecutionState.is_terminal(current_run.state):
+            current_run.state = ExecutionState.RUNNING
+            current_run.end_date = None
+
+        # Optionally reset downstream tasks in the target subflow
+        # We reset downstream tasks in the CHILD flow (not the parent)
+        if reset_downstream:
+            # Reset all downstream tasks of the target task in the child flow
+            # We need to iterate through all tasks and reset those that depend on the target
+            self._reset_downstream_in_subflow(current_run, target_task_id)
+
+        # Save the deepest subflow
+        self.store.save(current_run)
+
+        # Now walk back up the chain and reset all parent subflows to RUNNING
+        for parent_run, subflow_task_id in reversed(subflow_chain):
+            subflow_task = parent_run.tasks[subflow_task_id]
+
+            # Reset subflow task state to SCHEDULED (will re-execute)
+            subflow_task.state = ExecutionState.SCHEDULED
+            subflow_task.end_date = None
+            subflow_task.error = None
+            # Don't reset try_number for subflows
+
+            # Reset parent workflow state if it was terminal
+            if ExecutionState.is_terminal(parent_run.state):
+                parent_run.state = ExecutionState.RUNNING
+                parent_run.end_date = None
+
+            # Also reset downstream tasks in parent flows if reset_downstream is True
+            if reset_downstream:
+                self._reset_downstream_in_subflow(parent_run, subflow_task_id)
+
+            self.store.save(parent_run)
+
+    def _reset_downstream_in_subflow(
+        self, workflow_run: WorkflowRun, target_task_id: str
+    ) -> None:
+        """
+        Reset downstream tasks in a subflow without using dependency resolver.
+
+        This is a simple implementation that resets all tasks that are in
+        terminal state (SUCCESS, FAILED, SKIPPED) after the target task.
+        It assumes tasks are ordered or we want to reset all terminal tasks.
+
+        Args:
+            workflow_run: The workflow run containing the tasks
+            target_task_id: The task whose downstream tasks should be reset
+        """
+        # Simple approach: reset all tasks that are in terminal state
+        # This is safe because they will only re-execute if their dependencies are met
+        for task_id, task_instance in workflow_run.tasks.items():
+            if task_id != target_task_id and ExecutionState.is_terminal(task_instance.state):
+                task_instance.state = ExecutionState.SCHEDULED
+                task_instance.end_date = None
+                task_instance.error = None
+                task_instance.try_number = 0
+
+                # If it's a subflow, reset its tasks too
+                if task_instance.type == TaskType.FLOW:
+                    self._reset_subflow_tasks(task_instance)
 
     def can_retry_automatically(
         self, workflow_run: WorkflowRun, task_id: str
@@ -252,7 +400,12 @@ class RetryManager:
         """
         workflow_run = self.store.load(run_id)
         all_tasks = workflow_run.get_all_tasks_recursive(self.store)
-        return [task_id for task_id, task in all_tasks.items() if task.state == ExecutionState.FAILED]
+        failed = [task_id for task_id, task in all_tasks.items() if task.state == ExecutionState.FAILED]
+
+        if failed:
+            logger.info(f"Found {len(failed)} failed tasks in run_id={run_id}: {failed}")
+
+        return failed
 
     def retry_all_failed(self, run_id: str) -> list[str]:
         """
@@ -273,12 +426,16 @@ class RetryManager:
         failed_tasks = self.get_all_failed_tasks(run_id)
 
         if not failed_tasks:
+            logger.warning(f"No failed tasks found in run '{run_id}'")
             raise ValueError(f"No failed tasks found in run '{run_id}'")
+
+        logger.info(f"Retrying {len(failed_tasks)} failed tasks in run_id={run_id}")
 
         # Retry each failed task without reset_downstream
         for task_id in failed_tasks:
             self.manual_retry(run_id=run_id, task_id=task_id, reset_downstream=False)
 
+        logger.info(f"All failed tasks retried successfully in run_id={run_id}")
         return failed_tasks
 
     def validate_task_exists(self, run_id: str, task_id: str) -> None:
