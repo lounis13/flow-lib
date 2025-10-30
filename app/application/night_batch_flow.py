@@ -21,15 +21,15 @@ def build_run_type_flow(params: dict, type: str):
 
         pricing_flows.append(f"{type}_{version}_pricing_flow")
 
-        @flow.subflow(f"{type}_{version}_pricing_flow", depends_on=[f"{type}_{version}_flow"])
+        @flow.subflow(f"{type}_{version}_pricing_flow", name=f"{type} Pricing", depends_on=[f"{type}_{version}_flow"])
         def build_library_flow(ctx: Context):
             return build_pricing_flow(f"{type}_{version}_pricing")
 
-    @flow.task(f"{type}_calculate_difference", depends_on=pricing_flows)
+    @flow.task(f"{type}_calculate_difference", name="Calculating Diff", depends_on=pricing_flows)
     def calculate_difference(ctx: Context):
         ctx.log(f"Calculating difference for {ctx.params}")
 
-    @flow.task(f"{type}_send_notification", depends_on=[f"{type}_calculate_difference"])
+    @flow.task(f"{type}_send_notification", depends_on=[f"{type}_calculate_difference"], name=f"Send {type} Notification")
     def send_notification(ctx: Context):
         ctx.log(f"send notification for this run {ctx.params}")
 
@@ -41,7 +41,7 @@ def build_night_batch_flow(params: dict = None):
 
     run_type_flows = [f"{run_type.get('type')}_flow" for run_type in params.get("run_types")]
     for run_type_flow_name in run_type_flows:
-        @flow.subflow(run_type_flow_name)
+        @flow.subflow(run_type_flow_name, name="Run Type Flow")
         def run_type_flow(ctx: Context):
             return build_run_type_flow(params, type=run_type_flow_name)
 
