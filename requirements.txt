@@ -1,0 +1,46 @@
+sqlmodel
+sqlalchemy
+# Core Python dependencies for night-batch flow library
+# Python >= 3.10 required
+
+# ============================================================
+#                   CORE DEPENDENCIES
+# ============================================================
+
+# No external dependencies required for core flow library
+# Uses only Python standard library:
+# - asyncio (built-in)
+# - sqlite3 (built-in)
+# - json (built-in)
+# - dataclasses (built-in)
+# - typing (built-in)
+
+
+# ============================================================
+#                   DEVELOPMENT DEPENDENCIES
+# ============================================================
+
+# Testing framework
+pytest>=8.0.0,<9.0.0
+pytest-asyncio>=0.23.0,<2.0.0
+
+# Code quality and linting (optional)
+# black>=24.0.0
+# ruff>=0.1.0
+# mypy>=1.8.0
+
+# Coverage (optional)
+# pytest-cov>=4.1.0
+# coverage>=7.4.0
+
+
+# ============================================================
+#                   OPTIONAL DEPENDENCIES
+# ============================================================
+
+# For enhanced JSON serialization (optional)
+# orjson>=3.9.0
+
+# For alternative async implementations (optional)
+# trio>=0.24.0
+# anyio>=4.0.0
